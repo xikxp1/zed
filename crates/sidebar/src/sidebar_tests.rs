@@ -208,6 +208,7 @@ fn assert_remote_project_integration_sidebar_state(
                     title
                 );
             }
+            ListEntry::Subagent(_) => panic!("unexpected subagent"),
             ListEntry::Terminal(terminal) => {
                 panic!(
                     "unexpected sidebar terminal while simulating remote project integration flicker: title=`{}`",
@@ -694,6 +695,14 @@ fn visible_entries_as_strings(
                             };
                             format!("  {title}{worktree}{live}{status_str}{notified}{selected}")
                         }
+                    }
+                    ListEntry::Subagent(child) => {
+                        format!(
+                            "{}{} ({:?}){selected}",
+                            "  ".repeat(child.depth + 1),
+                            child.title,
+                            child.status
+                        )
                     }
                     ListEntry::Terminal(terminal) => {
                         let title = terminal.metadata.display_title();
@@ -1483,6 +1492,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
     };
     let thread = |name: &str| {
         ListEntry::Thread(Arc::new(ThreadEntry {
+            has_children: false,
             metadata: ThreadMetadata {
                 thread_id: ThreadId::new(),
                 session_id: Some(acp::SessionId::new(Arc::from(name))),
@@ -1499,6 +1509,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
             icon: IconName::ZedAgent,
             icon_from_external_svg: None,
             status: AgentThreadStatus::Completed,
+            is_busy: false,
             workspace: ThreadEntryWorkspace::Open(workspace.clone()),
             is_live: false,
             is_background: false,
@@ -1575,6 +1586,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 has_threads: true,
             },
             ListEntry::Thread(Arc::new(ThreadEntry {
+                has_children: false,
                 metadata: ThreadMetadata {
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-1"))),
@@ -1591,6 +1603,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Completed,
+                is_busy: false,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
                 is_live: false,
                 is_background: false,
@@ -1602,6 +1615,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             })),
             // Active thread with Running status
             ListEntry::Thread(Arc::new(ThreadEntry {
+                has_children: false,
                 metadata: ThreadMetadata {
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-2"))),
@@ -1618,6 +1632,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Running,
+                is_busy: true,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
                 is_live: true,
                 is_background: false,
@@ -1629,6 +1644,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             })),
             // Active thread with Error status
             ListEntry::Thread(Arc::new(ThreadEntry {
+                has_children: false,
                 metadata: ThreadMetadata {
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-3"))),
@@ -1645,6 +1661,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Error,
+                is_busy: false,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
                 is_live: true,
                 is_background: false,
@@ -1657,6 +1674,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             // Thread with WaitingForConfirmation status, not active
             // remote_connection: None,
             ListEntry::Thread(Arc::new(ThreadEntry {
+                has_children: false,
                 metadata: ThreadMetadata {
                     thread_id: ThreadId::new(),
                     session_id: Some(acp::SessionId::new(Arc::from("t-4"))),
@@ -1673,6 +1691,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::WaitingForConfirmation,
+                is_busy: true,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
                 is_live: false,
                 is_background: false,
@@ -1685,6 +1704,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             // Background thread that completed (should show notification)
             // remote_connection: None,
             ListEntry::Thread(Arc::new(ThreadEntry {
+                has_children: false,
                 metadata: ThreadMetadata {
                     thread_id: notified_thread_id,
                     session_id: Some(acp::SessionId::new(Arc::from("t-5"))),
@@ -1701,6 +1721,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 icon: IconName::ZedAgent,
                 icon_from_external_svg: None,
                 status: AgentThreadStatus::Completed,
+                is_busy: false,
                 workspace: ThreadEntryWorkspace::Open(workspace.clone()),
                 is_live: true,
                 is_background: true,
@@ -4496,6 +4517,424 @@ async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     });
 
     assert_eq!(parent_status, AgentThreadStatus::WaitingForConfirmation);
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread(&parent_session_id, window, cx);
+        assert!(
+            !ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_by_session(&parent_session_id)
+                .expect("root metadata")
+                .archived
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_nested_subagents_navigation_folding_and_live_updates(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let connection = StubAgentConnection::new().with_supports_load_session(true);
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(&panel, connection.clone(), cx);
+    send_message(&panel, cx);
+    let root_session_id = active_session_id(&panel, cx);
+    cx.run_until_parked();
+    save_test_thread_metadata(&root_session_id, &project, cx).await;
+    let root_thread_id = active_thread_id(&panel, cx);
+    let conversation = panel.read_with(cx, |panel, _| {
+        panel
+            .active_conversation_view()
+            .expect("conversation")
+            .clone()
+    });
+    let root = panel.read_with(cx, |panel, cx| {
+        panel.active_agent_thread(cx).expect("root thread")
+    });
+    let first = acp::SessionId::new("a-child");
+    let second = acp::SessionId::new("z-child");
+    let grandchild = acp::SessionId::new("grandchild");
+    root.update(cx, |thread, cx| {
+        for session_id in [&second, &first, &first] {
+            thread.subagent_spawned(session_id.clone(), cx);
+        }
+    });
+    cx.run_until_parked();
+    let first_thread = conversation.read_with(cx, |view, cx| {
+        view.thread_view(&first)
+            .expect("first child")
+            .read(cx)
+            .thread
+            .clone()
+    });
+    first_thread.update(cx, |thread, cx| {
+        thread.subagent_spawned(grandchild.clone(), cx)
+    });
+    cx.run_until_parked();
+
+    let children = |sidebar: &Sidebar| -> Vec<(acp::SessionId, usize)> {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Subagent(child) => Some((child.session_id.clone(), child.depth)),
+                _ => None,
+            })
+            .collect()
+    };
+    let expected = vec![
+        (first.clone(), 1),
+        (grandchild.clone(), 2),
+        (second.clone(), 1),
+    ];
+    sidebar.read_with(cx, |sidebar, cx| {
+        assert_eq!(children(sidebar), expected);
+        assert_eq!(sidebar.mru_entries_for_switcher(cx).len(), 1);
+        let store = ThreadMetadataStore::global(cx).read(cx);
+        for session_id in [&first, &second, &grandchild] {
+            assert!(store.entry_by_session(session_id).is_none());
+        }
+    });
+    let child_prompt = first_thread.update(cx, |thread, cx| thread.send_raw("Inspect files", cx));
+    first_thread.update(cx, |thread, cx| {
+        thread
+            .handle_session_update(
+                acp::SessionUpdate::SessionInfoUpdate(
+                    acp::SessionInfoUpdate::new().title("Inspect files"),
+                ),
+                cx,
+            )
+            .expect("title update");
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        let child = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Subagent(child) if child.session_id == first => Some(child),
+                _ => None,
+            })
+            .expect("child row");
+        assert_eq!(child.title.as_ref(), "Inspect files");
+        assert_eq!(child.status, AgentThreadStatus::Running);
+        let root = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread) if thread.metadata.thread_id == root_thread_id => {
+                    Some(thread)
+                }
+                _ => None,
+            })
+            .expect("root row");
+        assert!(root.is_busy);
+        assert_eq!(root.status, AgentThreadStatus::Running);
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.selection = sidebar.contents.entries.iter().position(|entry| {
+            matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == root_thread_id)
+        });
+        sidebar.archive_selected_thread(&ArchiveSelectedThread, window, cx);
+        sidebar.archive_thread(&root_session_id, window, cx);
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        let index = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(
+                |entry| matches!(entry, ListEntry::Subagent(child) if child.session_id == first),
+            )
+            .expect("child row");
+        sidebar.selection = Some(index);
+        sidebar.confirm(&Confirm, window, cx);
+        sidebar.rename_selected_thread(&RenameSelectedThread, window, cx);
+        sidebar.archive_selected_thread(&ArchiveSelectedThread, window, cx);
+        assert!(sidebar.rename_target.is_none());
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, cx| {
+        assert_eq!(panel.active_thread_id(cx), Some(root_thread_id));
+        let conversation = panel.active_conversation_view().expect("conversation");
+        assert_eq!(
+            conversation
+                .read(cx)
+                .active_thread()
+                .expect("active child")
+                .read(cx)
+                .session_id,
+            first
+        );
+        assert!(
+            !ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_by_session(&root_session_id)
+                .expect("root metadata")
+                .archived
+        );
+    });
+    sidebar.read_with(cx, |sidebar, cx| {
+        let active = sidebar.active_entry.as_ref().expect("active entry");
+        let selected: Vec<_> = sidebar.contents.entries.iter().filter(|entry| active.matches_visible_entry(entry, cx)).collect();
+        assert_eq!(selected.len(), 1);
+        assert!(matches!(selected.first(), Some(ListEntry::Subagent(child)) if child.session_id == first));
+    });
+
+    sidebar.update_in(cx, |sidebar, _, cx| {
+        let child = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Subagent(child)
+                    if child.root_thread_id == root_thread_id && child.session_id == first =>
+                {
+                    Some(child)
+                }
+                _ => None,
+            })
+            .expect("child row");
+        Sidebar::stop_subagent(child, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        child_prompt
+            .await
+            .expect("child prompt succeeds")
+            .expect("child prompt responds")
+            .stop_reason,
+        acp::StopReason::Cancelled
+    );
+    first_thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.status(), ThreadStatus::Idle)
+    });
+    root.read_with(cx, |thread, _| {
+        assert_eq!(thread.status(), ThreadStatus::Idle)
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        let first_index = sidebar.contents.entries.iter().position(|entry| {
+            matches!(entry, ListEntry::Subagent(child) if child.session_id == first)
+        }).expect("child row");
+        sidebar.selection = Some(first_index);
+        sidebar.collapse_selected_entry(&SelectParent, window, cx);
+        assert_eq!(children(sidebar), vec![(first.clone(), 1), (second.clone(), 1)]);
+        sidebar.expand_selected_entry(&SelectChild, window, cx);
+        assert_eq!(children(sidebar), expected);
+        let root_index = sidebar.contents.entries.iter().position(|entry| {
+            matches!(entry, ListEntry::Thread(thread) if thread.metadata.session_id.as_ref() == Some(&root_session_id))
+        }).expect("root row");
+        sidebar.toggle_subagents(root_index, cx);
+        assert!(children(sidebar).is_empty());
+        assert_eq!(sidebar.selection, Some(root_index));
+        sidebar.expand_selected_entry(&SelectChild, window, cx);
+        assert_eq!(children(sidebar), expected);
+        sidebar.confirm(&Confirm, window, cx);
+    });
+    cx.run_until_parked();
+    conversation.read_with(cx, |view, cx| {
+        assert_eq!(
+            view.active_thread()
+                .expect("active root")
+                .read(cx)
+                .session_id,
+            root_session_id
+        );
+    });
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(sidebar.contents.entries.iter().any(|entry| {
+            matches!(entry, ListEntry::Subagent(child) if child.session_id == first && child.status == AgentThreadStatus::Completed)
+        }));
+        assert!(sidebar.contents.entries.iter().any(|entry| {
+            matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == root_thread_id && !thread.is_busy && thread.status == AgentThreadStatus::Completed)
+        }));
+    });
+
+    root.update(cx, |thread, cx| {
+        thread.set_parent_session_id(grandchild.clone(), cx)
+    });
+    sidebar.update_in(cx, |sidebar, _, cx| sidebar.update_entries(cx));
+    sidebar.read_with(cx, |sidebar, _| assert_eq!(children(sidebar), expected));
+}
+
+#[gpui::test]
+async fn test_subagent_identity_and_switcher_restore_are_scoped_to_root(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let child_session = acp::SessionId::new("shared-child");
+    let mut roots = Vec::new();
+    let mut children = Vec::new();
+    for index in 0..2 {
+        cx.update(|_, cx| {
+            cx.global::<acp_thread::StubSessionCounter>()
+                .0
+                .store(100, std::sync::atomic::Ordering::SeqCst);
+        });
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id(AgentId::new(format!("collision-{index}")));
+        open_thread_with_custom_connection(&panel, connection.clone(), cx);
+        send_message(&panel, cx);
+        let session_id = active_session_id(&panel, cx);
+        assert_eq!(session_id, acp::SessionId::new("100"));
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        let conversation = panel.read_with(cx, |panel, _| {
+            panel
+                .active_conversation_view()
+                .expect("conversation")
+                .clone()
+        });
+        let root = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).expect("root"));
+        root.update(cx, |thread, cx| {
+            thread.subagent_spawned(child_session.clone(), cx)
+        });
+        cx.run_until_parked();
+        let child = conversation.read_with(cx, |view, cx| {
+            view.thread_view(&child_session)
+                .expect("child")
+                .read(cx)
+                .thread
+                .clone()
+        });
+        child.update(cx, |thread, cx| {
+            thread.set_external_subagent_status(acp_thread::ExternalSubagentStatus::InProgress, cx)
+        });
+        roots.push(conversation);
+        children.push(child);
+    }
+    cx.run_until_parked();
+    let [first, second] = roots.as_slice() else {
+        panic!("two roots")
+    };
+    let first_id = first.read_with(cx, |view, _| view.parent_id());
+    let second_id = second.read_with(cx, |view, _| view.parent_id());
+    assert_ne!(first_id, second_id);
+    sidebar.update_in(cx, |sidebar, _, cx| {
+        sidebar.update_entries(cx);
+        let child_rows: Vec<_> = sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Subagent(child) => {
+                    Some((child.root_thread_id, child.conversation.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(child_rows.len(), 2);
+        assert!(child_rows.contains(&(first_id, first.clone())));
+        assert!(child_rows.contains(&(second_id, second.clone())));
+        let first_index = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry,
+            ListEntry::Thread(thread) if thread.metadata.thread_id == first_id)
+            })
+            .expect("first root");
+        sidebar.toggle_subagents(first_index, cx);
+        assert_eq!(
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, ListEntry::Subagent(_)))
+                .count(),
+            1
+        );
+        assert!(sidebar.contents.entries.iter().any(|entry| matches!(entry,
+            ListEntry::Subagent(child) if child.root_thread_id == second_id)));
+        sidebar.toggle_subagents(first_index, cx);
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.selection = sidebar.contents.entries.iter().position(|entry| {
+            matches!(entry,
+            ListEntry::Subagent(child) if child.root_thread_id == first_id)
+        });
+        sidebar.confirm(&Confirm, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(active_thread_id(&panel, cx), first_id);
+    sidebar.update_in(cx, |sidebar, _, cx| {
+        let child = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Subagent(child) if child.root_thread_id == first_id => Some(child),
+                _ => None,
+            })
+            .expect("first child row");
+        Sidebar::stop_subagent(child, cx);
+    });
+    cx.run_until_parked();
+    let [first_child, second_child] = children.as_slice() else {
+        panic!("two children")
+    };
+    first_child.read_with(cx, |thread, _| {
+        assert_eq!(thread.status(), ThreadStatus::Idle)
+    });
+    second_child.read_with(cx, |thread, _| {
+        assert_eq!(thread.status(), ThreadStatus::Generating)
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.on_toggle_thread_switcher(&ToggleThreadSwitcher::default(), window, cx);
+    });
+    cx.run_until_parked();
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        let switcher = sidebar.thread_switcher.as_ref().expect("switcher");
+        switcher
+            .focus_handle(cx)
+            .dispatch_action(&menu::Cancel, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(active_thread_id(&panel, cx), first_id);
+    first.read_with(cx, |view, cx| {
+        assert_eq!(
+            view.active_thread()
+                .expect("restored child")
+                .read(cx)
+                .session_id,
+            child_session
+        );
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.selection = sidebar.contents.entries.iter().position(|entry| {
+            matches!(entry,
+            ListEntry::Thread(thread) if thread.metadata.thread_id == first_id)
+        });
+        sidebar.confirm(&Confirm, window, cx);
+    });
+    cx.run_until_parked();
+    first.read_with(cx, |view, _| {
+        assert_eq!(view.active_thread().cloned(), view.root_thread_view())
+    });
+    sidebar.update_in(cx, |sidebar, _, cx| sidebar.stop_thread(&first_id, cx));
+    cx.run_until_parked();
+    second_child.read_with(cx, |thread, _| {
+        assert_eq!(thread.status(), ThreadStatus::Generating)
+    });
+    sidebar.update_in(cx, |sidebar, _, cx| sidebar.stop_thread(&second_id, cx));
+    cx.run_until_parked();
+    first_child.read_with(cx, |thread, _| {
+        assert_eq!(thread.status(), ThreadStatus::Idle)
+    });
+    second_child.read_with(cx, |thread, _| {
+        assert_eq!(thread.status(), ThreadStatus::Idle)
+    });
 }
 
 #[gpui::test]
@@ -5737,7 +6176,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::Subagent(_)
+                | ListEntry::ProjectHeader { .. }
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -5823,7 +6264,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::Subagent(_)
+                | ListEntry::ProjectHeader { .. }
+                | ListEntry::Terminal(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -5862,7 +6305,9 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::Subagent(_)
+                | ListEntry::ProjectHeader { .. }
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -7955,6 +8400,7 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                         title, worktree_name
                     );
                 }
+                ListEntry::Subagent(_) => panic!("unexpected subagent"),
                 ListEntry::Terminal(terminal) => {
                     panic!(
                         "unexpected sidebar terminal while opening linked worktree thread: title=`{}`",
@@ -11403,7 +11849,7 @@ async fn test_archive_last_thread_on_linked_worktree_does_not_create_new_thread_
 
     // Open a thread in the linked worktree panel and send a message
     // so it becomes the active thread.
-    let connection = StubAgentConnection::new();
+    let connection = StubAgentConnection::new().with_supports_load_session(true);
     open_thread_with_connection(&worktree_panel, connection.clone(), cx);
     send_message(&worktree_panel, cx);
 
@@ -11467,6 +11913,64 @@ async fn test_archive_last_thread_on_linked_worktree_does_not_create_new_thread_
             &worktree_thread_id,
             "worktree thread should be active before archiving",
         );
+    });
+
+    let conversation = worktree_panel.read_with(cx, |panel, _| {
+        panel
+            .active_conversation_view()
+            .expect("worktree conversation")
+            .clone()
+    });
+    let root = worktree_panel.read_with(cx, |panel, cx| {
+        panel.active_agent_thread(cx).expect("root thread")
+    });
+    conversation.read_with(cx, |view, cx| {
+        assert!(view.is_busy(cx));
+        assert!(!view.has_busy_subagents(cx));
+    });
+    let child_session_id = acp::SessionId::new("worktree-child");
+    root.update(cx, |thread, cx| {
+        thread.subagent_spawned(child_session_id.clone(), cx);
+    });
+    cx.run_until_parked();
+    let child = conversation.read_with(cx, |view, cx| {
+        view.thread_view(&child_session_id)
+            .expect("loaded child")
+            .read(cx)
+            .thread
+            .clone()
+    });
+    child.update(cx, |thread, cx| {
+        thread.set_external_subagent_status(acp_thread::ExternalSubagentStatus::InProgress, cx);
+    });
+    cx.run_until_parked();
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread(&worktree_thread_id, window, cx);
+    });
+    cx.run_until_parked();
+    conversation.read_with(cx, |view, cx| {
+        assert!(view.has_busy_subagents(cx));
+        assert!(
+            !ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_by_session(&worktree_thread_id)
+                .expect("root metadata")
+                .archived
+        );
+        assert!(
+            multi_workspace
+                .read(cx)
+                .workspaces()
+                .any(|workspace| workspace == &worktree_workspace)
+        );
+    });
+    child.update(cx, |thread, cx| {
+        thread.set_external_subagent_status(acp_thread::ExternalSubagentStatus::Completed, cx);
+    });
+    cx.run_until_parked();
+    conversation.read_with(cx, |view, cx| {
+        assert!(view.is_busy(cx));
+        assert!(!view.has_busy_subagents(cx));
     });
 
     // Archive the worktree thread — it's the only thread using ochre-drift.

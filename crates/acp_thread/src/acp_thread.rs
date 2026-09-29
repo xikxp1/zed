@@ -131,6 +131,49 @@ pub fn command_category_from_meta(meta: &Option<acp_v1::Meta>) -> Option<Command
 
 /// Key used in ACP ToolCall meta to store the session id and message indexes
 pub const SUBAGENT_SESSION_INFO_META_KEY: &str = "subagent_session_info";
+pub const SUBAGENT_SESSIONS_CAPABILITY_META_KEY: &str = "zed.dev/subagent-sessions";
+pub const SUBAGENT_SESSION_META_KEY: &str = "zed.dev/subagent-session";
+
+pub fn supports_subagent_sessions(meta: &Option<acp_v1::Meta>) -> bool {
+    meta.as_ref()
+        .and_then(|meta| meta.get(SUBAGENT_SESSIONS_CAPABILITY_META_KEY))
+        .and_then(|capability| capability.get("version"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(1)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalSubagentStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    // Cancellation is local; the bridge only sends the four statuses above.
+    #[serde(skip)]
+    Cancelled,
+}
+
+impl ExternalSubagentStatus {
+    fn is_generating(self) -> bool {
+        matches!(self, Self::Pending | Self::InProgress)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExternalSubagentSessionInfo {
+    pub parent_session_id: acp_v1::SessionId,
+    pub parent_tool_call_id: acp_v1::ToolCallId,
+    pub status: ExternalSubagentStatus,
+}
+
+pub fn external_subagent_session_info_from_meta(
+    meta: &Option<acp_v1::Meta>,
+) -> Option<ExternalSubagentSessionInfo> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(SUBAGENT_SESSION_META_KEY))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
 
 pub const SANDBOX_AUTHORIZATION_META_KEY: &str = "sandbox_authorization";
 
@@ -3380,6 +3423,7 @@ pub struct AcpThread {
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
+    external_subagent_status: Option<ExternalSubagentStatus>,
     connection: Rc<dyn AgentConnection>,
     submissions: SessionSubmissions,
     activity: SessionActivity,
@@ -3706,6 +3750,7 @@ impl AcpThread {
             provisional_title: None,
             project,
             running_turn: None,
+            external_subagent_status: None,
             turn_id: 0,
             submissions: SessionSubmissions::new(receipt_submissions),
             activity: SessionActivity::default(),
@@ -3733,6 +3778,71 @@ impl AcpThread {
 
     pub fn parent_session_id(&self) -> Option<&acp_v1::SessionId> {
         self.parent_session_id.as_ref()
+    }
+
+    pub fn set_parent_session_id(
+        &mut self,
+        parent_session_id: acp_v1::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if parent_session_id != self.session_id && self.parent_session_id.is_none() {
+            self.parent_session_id = Some(parent_session_id);
+            cx.notify();
+        }
+    }
+
+    /// Called only after the connection has negotiated and validated the child linkage.
+    pub fn set_external_subagent_status(
+        &mut self,
+        status: ExternalSubagentStatus,
+        cx: &mut Context<Self>,
+    ) {
+        if self.parent_session_id.is_none() {
+            return;
+        }
+        let previous = self.external_subagent_status;
+        // A child represents one task, not a new prompt on every subscription.
+        // Queued progress must not revive it after cancellation or completion.
+        if previous.is_some_and(|previous| !previous.is_generating()) && status.is_generating() {
+            return;
+        }
+        let status = if previous == Some(ExternalSubagentStatus::Cancelled) {
+            ExternalSubagentStatus::Cancelled
+        } else {
+            status
+        };
+        let previous_thread_status = self.status();
+        self.external_subagent_status = Some(status);
+        self.had_error = status == ExternalSubagentStatus::Failed;
+        if !status.is_generating() {
+            self.flush_streaming_text(cx);
+            self.shrink_message_source_capacity(0);
+            self.cancel_pending_turn_entries(cx);
+        }
+        if self.status() != previous_thread_status {
+            cx.emit(AcpThreadEvent::StatusChanged);
+        }
+        if previous != Some(status) {
+            match status {
+                ExternalSubagentStatus::Completed => {
+                    cx.emit(AcpThreadEvent::Stopped {
+                        activity_generation: self.activity.generation(),
+                        activity_duration: self.activity.duration(),
+                        stop_reason: Some(acp_v2::StopReason::EndTurn),
+                    });
+                }
+                ExternalSubagentStatus::Failed => cx.emit(AcpThreadEvent::Error),
+                ExternalSubagentStatus::Cancelled => {
+                    cx.emit(AcpThreadEvent::Stopped {
+                        activity_generation: self.activity.generation(),
+                        activity_duration: self.activity.duration(),
+                        stop_reason: Some(acp_v2::StopReason::Cancelled),
+                    });
+                }
+                ExternalSubagentStatus::Pending | ExternalSubagentStatus::InProgress => {}
+            }
+            cx.notify();
+        }
     }
 
     pub fn prompt_capabilities(&self) -> acp_v1::PromptCapabilities {
@@ -3854,9 +3964,14 @@ impl AcpThread {
     }
 
     pub fn status(&self) -> ThreadStatus {
-        match self.foreground_activity() {
-            ForegroundActivity::Idle => ThreadStatus::Idle,
-            _ => ThreadStatus::Generating,
+        if self.foreground_activity() != ForegroundActivity::Idle
+            || self
+                .external_subagent_status
+                .is_some_and(ExternalSubagentStatus::is_generating)
+        {
+            ThreadStatus::Generating
+        } else {
+            ThreadStatus::Idle
         }
     }
 
@@ -6379,6 +6494,14 @@ impl AcpThread {
         self.cancel_outstanding_elicitations(cx);
 
         let Some(turn) = self.running_turn.take() else {
+            if self
+                .external_subagent_status
+                .is_some_and(ExternalSubagentStatus::is_generating)
+            {
+                self.mark_pending_entries_as_canceled(permission_outcome.clone(), cx);
+                self.connection.cancel(&self.session_id, cx);
+                self.set_external_subagent_status(ExternalSubagentStatus::Cancelled, cx);
+            }
             let request_ids = self.permission_requests.keys().copied().collect::<Vec<_>>();
             for id in request_ids {
                 self.cancel_permission_request_with_outcome(id, permission_outcome.clone(), cx);
@@ -6400,7 +6523,8 @@ impl AcpThread {
 
     fn update_idle_sleep_prevention(&mut self, cx: &mut Context<Self>) {
         if !AgentSettings::get_global(cx).prevent_idle_sleep
-            || self.foreground_activity() != ForegroundActivity::Running
+            || self.status() != ThreadStatus::Generating
+            || self.is_waiting_for_confirmation()
         {
             self.idle_sleep_prevention = IdleSleepPrevention::Inactive;
             return;
@@ -7099,6 +7223,12 @@ impl AcpThread {
     }
 
     pub fn emit_load_error(&mut self, error: LoadError, cx: &mut Context<Self>) {
+        if self
+            .external_subagent_status
+            .is_some_and(ExternalSubagentStatus::is_generating)
+        {
+            self.set_external_subagent_status(ExternalSubagentStatus::Failed, cx);
+        }
         cx.emit(AcpThreadEvent::LoadError(error));
     }
 
@@ -15515,6 +15645,104 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[gpui::test]
+    async fn test_external_subagent_failure_settles_without_local_turn(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let errors = Rc::new(RefCell::new(0));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&thread, {
+                let errors = errors.clone();
+                move |_, event, _| {
+                    if matches!(event, AcpThreadEvent::Error) {
+                        *errors.borrow_mut() += 1;
+                    }
+                }
+            })
+        });
+        thread.update(cx, |thread, cx| {
+            thread.set_parent_session_id(acp_v1::SessionId::new("parent"), cx);
+            thread.set_external_subagent_status(ExternalSubagentStatus::Pending, cx);
+            assert!(thread.running_turn.is_none());
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(acp_v1::ToolCall::new(
+                        "tool",
+                        "Unfinished work",
+                    )),
+                    cx,
+                )
+                .expect("pending tool");
+            thread.set_external_subagent_status(ExternalSubagentStatus::InProgress, cx);
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                        "Partial result".into(),
+                    )),
+                    cx,
+                )
+                .expect("child output");
+            thread.set_external_subagent_status(ExternalSubagentStatus::Failed, cx);
+            thread.set_external_subagent_status(ExternalSubagentStatus::Failed, cx);
+            thread.set_external_subagent_status(ExternalSubagentStatus::InProgress, cx);
+            assert!(thread.running_turn.is_none());
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert!(thread.had_error());
+            assert!(thread.streaming_text_buffer.is_none());
+            assert!(thread.to_markdown(cx).contains("Partial result"));
+            let Some(AgentThreadEntry::ToolCall(tool)) = thread.entries().first() else {
+                panic!("expected tool")
+            };
+            assert!(matches!(tool.status(), ToolCallStatus::Canceled));
+        });
+        assert_eq!(*errors.borrow(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_native_subagent_metadata_does_not_drive_external_lifecycle(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.set_parent_session_id(acp_v1::SessionId::new("parent"), cx)
+        });
+        let (complete, request) = start_test_turn(&thread, cx);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::SessionInfoUpdate(
+                        acp_v1::SessionInfoUpdate::new().meta(acp_v1::Meta::from_iter([(
+                            SUBAGENT_SESSION_META_KEY.into(),
+                            serde_json::json!({
+                                "parent_session_id": "parent",
+                                "parent_tool_call_id": "tool",
+                                "status": "failed",
+                            }),
+                        )])),
+                    ),
+                    cx,
+                )
+                .expect("native metadata");
+            assert!(thread.external_subagent_status.is_none());
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+            assert!(!thread.had_error());
+        });
+        let cancel = thread.update(cx, |thread, cx| thread.cancel(cx));
+        complete
+            .send(Ok(acp_v1::PromptResponse::new(
+                acp_v1::StopReason::Cancelled,
+            )))
+            .expect("native turn still awaiting backend");
+        cancel.await;
+        request.await.expect("native cancellation completes");
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
     }
 
     fn only_thread_elicitation(thread: &AcpThread) -> (ElicitationEntryId, &Elicitation) {

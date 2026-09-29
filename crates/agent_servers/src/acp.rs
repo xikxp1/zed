@@ -8,7 +8,10 @@ pub use terminal_updates::{DecodedTerminalNotification, DecodedTerminalUpdate};
 
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, ElicitationStore,
+    AgentSessionListResponse, ElicitationStore, ExternalSubagentStatus,
+    SUBAGENT_SESSION_INFO_META_KEY, SUBAGENT_SESSIONS_CAPABILITY_META_KEY,
+    external_subagent_session_info_from_meta, subagent_session_info_from_meta,
+    supports_subagent_sessions,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
@@ -116,6 +119,72 @@ struct ClientContext {
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
+    subagent_sessions: Rc<RefCell<ExternalSubagentSessions>>,
+}
+
+#[derive(Default)]
+struct ExternalSubagentSessions {
+    negotiated: bool,
+    parents: HashMap<acp::SessionId, ExternalSubagentLink>,
+}
+
+struct ExternalSubagentLink {
+    parent_session_id: acp::SessionId,
+    parent_tool_call_id: acp::ToolCallId,
+    announced_for: Option<gpui::EntityId>,
+}
+
+impl ExternalSubagentSessions {
+    fn register(
+        &mut self,
+        session_id: &acp::SessionId,
+        parent_session_id: &acp::SessionId,
+        parent_tool_call_id: &acp::ToolCallId,
+    ) -> Result<()> {
+        anyhow::ensure!(self.negotiated, "subagent sessions were not negotiated");
+        anyhow::ensure!(
+            !session_id.0.is_empty()
+                && !parent_session_id.0.is_empty()
+                && !parent_tool_call_id.0.is_empty(),
+            "subagent linkage contains an empty ID"
+        );
+        let mut ancestor = parent_session_id;
+        loop {
+            anyhow::ensure!(ancestor != session_id, "cyclic subagent linkage");
+            match self.parents.get(ancestor) {
+                Some(link) => ancestor = &link.parent_session_id,
+                None => break,
+            }
+        }
+        if let Some(link) = self.parents.get(session_id) {
+            anyhow::ensure!(
+                &link.parent_session_id == parent_session_id
+                    && &link.parent_tool_call_id == parent_tool_call_id,
+                "conflicting subagent linkage"
+            );
+        } else {
+            self.parents.insert(
+                session_id.clone(),
+                ExternalSubagentLink {
+                    parent_session_id: parent_session_id.clone(),
+                    parent_tool_call_id: parent_tool_call_id.clone(),
+                    announced_for: None,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn should_announce(&mut self, session_id: &acp::SessionId, parent: gpui::EntityId) -> bool {
+        let Some(link) = self.parents.get_mut(session_id) else {
+            return false;
+        };
+        if link.announced_for == Some(parent) {
+            return false;
+        }
+        link.announced_for = Some(parent);
+        true
+    }
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -129,6 +198,32 @@ trait ForegroundWorkItem: Send {
 }
 
 type ForegroundWork = Box<dyn ForegroundWorkItem>;
+
+struct ConnectionClosedForegroundWork;
+
+impl ForegroundWorkItem for ConnectionClosedForegroundWork {
+    fn run(self: Box<Self>, cx: &mut AsyncApp, context: &ClientContext) {
+        let threads: Vec<_> = context
+            .sessions
+            .borrow()
+            .values()
+            .filter_map(|session| session.thread.upgrade())
+            .collect();
+        for thread in threads {
+            thread.update(cx, |thread, cx| {
+                if thread.parent_session_id().is_some()
+                    && thread.status() == acp_thread::ThreadStatus::Generating
+                {
+                    thread.emit_load_error(LoadError::Other("Agent connection closed".into()), cx);
+                }
+            });
+        }
+    }
+
+    fn reject(self: Box<Self>) {
+        log::debug!("ACP foreground dispatch closed before connection shutdown notification");
+    }
+}
 
 struct ForegroundBarrier {
     acknowledgment: futures::channel::oneshot::Sender<()>,
@@ -275,6 +370,7 @@ pub struct AcpConnection {
     connection: ConnectionTo<Agent>,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     pending_sessions: RefCell<HashMap<acp::SessionId, PendingAcpSession>>,
+    subagent_sessions: Rc<RefCell<ExternalSubagentSessions>>,
     auth_methods: Vec<acp::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
@@ -678,6 +774,10 @@ fn client_capabilities_for_agent(
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        (
+            SUBAGENT_SESSIONS_CAPABILITY_META_KEY.into(),
+            serde_json::json!({ "version": 1 }),
+        ),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -737,6 +837,7 @@ impl AcpConnection {
             debug_log,
         } = transport::spawn_stdio(&project, command, cx)?;
         let sessions = Rc::new(RefCell::new(HashMap::default()));
+        let subagent_sessions = Rc::new(RefCell::new(ExternalSubagentSessions::default()));
 
         let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
             (
@@ -764,9 +865,17 @@ impl AcpConnection {
         let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
         let connection_future =
             connect_client_future("zed", transport, dispatch_tx.clone(), connection_tx);
-        let io_task = cx.background_spawn(async move {
-            if let Err(err) = connection_future.await {
-                log::error!("ACP connection error: {err}");
+        let io_task = cx.background_spawn({
+            let dispatch_tx = dispatch_tx.clone();
+            async move {
+                if let Err(err) = connection_future.await {
+                    log::error!("ACP connection error: {err}");
+                }
+                if let Err(error) =
+                    dispatch_tx.unbounded_send(Box::new(ConnectionClosedForegroundWork))
+                {
+                    error.into_inner().reject();
+                }
             }
         });
 
@@ -800,6 +909,7 @@ impl AcpConnection {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            subagent_sessions: subagent_sessions.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -880,6 +990,9 @@ impl AcpConnection {
             return Err(UnsupportedVersion.into());
         }
 
+        subagent_sessions.borrow_mut().negotiated =
+            supports_subagent_sessions(&response.agent_capabilities.meta);
+
         let wait_task = cx.spawn({
             let sessions = sessions.clone();
             let debug_log = debug_log.clone();
@@ -959,6 +1072,7 @@ impl AcpConnection {
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
             agent_capabilities: response.agent_capabilities,
+            subagent_sessions,
             request_elicitations,
             defaults,
             session_list,
@@ -982,6 +1096,7 @@ impl AcpConnection {
         connection: ConnectionTo<Agent>,
         sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
         agent_capabilities: acp::AgentCapabilities,
+        subagent_sessions: Rc<RefCell<ExternalSubagentSessions>>,
         request_elicitations: Entity<ElicitationStore>,
         agent_server_store: WeakEntity<AgentServerStore>,
         io_task: Task<()>,
@@ -1003,6 +1118,7 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
+            subagent_sessions,
             request_elicitations,
             defaults,
             child: None,
@@ -1065,13 +1181,20 @@ impl AcpConnection {
         }
     }
 
-    fn remove_pending_session(&self, session_id: &acp::SessionId, thread_id: gpui::EntityId) {
+    fn remove_pending_session(
+        &self,
+        session_id: &acp::SessionId,
+        thread_id: gpui::EntityId,
+    ) -> bool {
         let mut sessions = self.pending_sessions.borrow_mut();
         if sessions
             .get(session_id)
             .is_some_and(|session| session.thread.entity_id() == thread_id)
         {
             sessions.remove(session_id);
+            true
+        } else {
+            false
         }
     }
 
@@ -1182,10 +1305,16 @@ impl AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
 
+        let parent_session_id = self
+            .subagent_sessions
+            .borrow()
+            .parents
+            .get(&session_id)
+            .map(|link| link.parent_session_id.clone());
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
         let thread = cx.new(|cx| {
-            AcpThread::new(
-                None,
+            let mut thread = AcpThread::new(
+                parent_session_id.clone(),
                 title,
                 Some(work_dirs),
                 self.clone(),
@@ -1194,7 +1323,11 @@ impl AcpConnection {
                 session_id.clone(),
                 watch::Receiver::constant(self.agent_capabilities.prompt_capabilities.clone()),
                 cx,
-            )
+            );
+            if parent_session_id.is_some() {
+                thread.set_external_subagent_status(ExternalSubagentStatus::Pending, cx);
+            }
+            thread
         });
         self.register_session(session_id.clone(), &thread, None, None, cx);
 
@@ -1231,9 +1364,28 @@ impl AcpConnection {
                     {
                         Ok(state) => state,
                         Err(error) => {
+                            if let Some(thread) = thread.upgrade() {
+                                thread.update(cx, |thread, cx| {
+                                    if thread.parent_session_id().is_some() {
+                                        thread.emit_load_error(
+                                            LoadError::Other(error.to_string().into()),
+                                            cx,
+                                        );
+                                    }
+                                });
+                            }
                             connection_state.remove_session(&session_id, thread.entity_id());
-                            connection_state
-                                .remove_pending_session(&session_id, thread.entity_id());
+                            if connection_state
+                                .remove_pending_session(&session_id, thread.entity_id())
+                                && let Some(link) = connection_state
+                                    .subagent_sessions
+                                    .borrow_mut()
+                                    .parents
+                                    .get_mut(&session_id)
+                            {
+                                // Only the current load may allow later metadata to retry discovery.
+                                link.announced_for = None;
+                            }
                             return Err(Arc::new(error));
                         }
                     };
@@ -2487,12 +2639,14 @@ pub mod test_support {
             .await?;
 
         let agent_capabilities = response.agent_capabilities;
+        let subagent_sessions = Rc::new(RefCell::new(ExternalSubagentSessions::default()));
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            subagent_sessions: subagent_sessions.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -2511,6 +2665,7 @@ pub mod test_support {
                 client_conn,
                 sessions,
                 agent_capabilities,
+                subagent_sessions,
                 request_elicitations,
                 agent_server_store,
                 client_io_task,
@@ -4244,6 +4399,7 @@ mod tests {
                 client_conn,
                 sessions,
                 acp::AgentCapabilities::default(),
+                Rc::new(RefCell::new(ExternalSubagentSessions::default())),
                 request_elicitations,
                 WeakEntity::new_invalid(),
                 client_io_task,
@@ -4556,6 +4712,13 @@ exit 7
         }
     }
 
+    #[derive(Default)]
+    struct FakeSubagentOptions {
+        capability: Option<serde_json::Value>,
+        cancelled_sessions: Arc<Mutex<Vec<acp::SessionId>>>,
+        load_session_error: Arc<Mutex<Option<acp::Error>>>,
+    }
+
     async fn connect_fake_agent(
         close_session_gate: Option<async_channel::Receiver<()>>,
         cx: &mut gpui::TestAppContext,
@@ -4574,6 +4737,45 @@ exit 7
     async fn connect_fake_agent_with_handle(
         close_session_gate: Option<async_channel::Receiver<()>>,
         agent_sender: Option<futures::channel::oneshot::Sender<ConnectionTo<Client>>>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Rc<AcpConnection>,
+        Entity<project::Project>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<acp::SessionUpdate>>>,
+        Arc<std::sync::Mutex<Option<async_channel::Receiver<()>>>>,
+        Task<anyhow::Result<()>>,
+    ) {
+        connect_fake_agent_with_options(
+            close_session_gate,
+            agent_sender,
+            FakeSubagentOptions::default(),
+            cx,
+        )
+        .await
+    }
+
+    async fn connect_fake_agent_with_subagents(
+        close_session_gate: Option<async_channel::Receiver<()>>,
+        subagents: FakeSubagentOptions,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Rc<AcpConnection>,
+        Entity<project::Project>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<acp::SessionUpdate>>>,
+        Arc<std::sync::Mutex<Option<async_channel::Receiver<()>>>>,
+        Task<anyhow::Result<()>>,
+    ) {
+        connect_fake_agent_with_options(close_session_gate, None, subagents, cx).await
+    }
+
+    async fn connect_fake_agent_with_options(
+        close_session_gate: Option<async_channel::Receiver<()>>,
+        agent_sender: Option<futures::channel::oneshot::Sender<ConnectionTo<Client>>>,
+        subagents: FakeSubagentOptions,
         cx: &mut gpui::TestAppContext,
     ) -> (
         Rc<AcpConnection>,
@@ -4615,15 +4817,22 @@ exit 7
             .name("fake-agent")
             .on_receive_request(
                 async move |req: acp::InitializeRequest, responder, _cx| {
+                    let mut capabilities = acp::AgentCapabilities::default()
+                        .load_session(true)
+                        .session_capabilities(
+                            acp::SessionCapabilities::default()
+                                .close(acp::SessionCloseCapabilities::new()),
+                        );
+                    if let Some(capability) = subagents.capability.clone() {
+                        assert!(supports_subagent_sessions(&req.client_capabilities.meta));
+                        capabilities = capabilities.meta(acp::Meta::from_iter([(
+                            SUBAGENT_SESSIONS_CAPABILITY_META_KEY.into(),
+                            capability,
+                        )]));
+                    }
                     responder.respond(
-                        acp::InitializeResponse::new(req.protocol_version).agent_capabilities(
-                            acp::AgentCapabilities::default()
-                                .load_session(true)
-                                .session_capabilities(
-                                    acp::SessionCapabilities::default()
-                                        .close(acp::SessionCloseCapabilities::new()),
-                                ),
-                        ),
+                        acp::InitializeResponse::new(req.protocol_version)
+                            .agent_capabilities(capabilities),
                     )
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -4651,8 +4860,10 @@ exit 7
                     let load_count = load_count.clone();
                     let load_session_updates = load_session_updates.clone();
                     let load_session_gate = load_session_gate.clone();
+                    let load_session_error = subagents.load_session_error.clone();
                     async move |req: acp::LoadSessionRequest, responder, cx| {
                         load_count.fetch_add(1, Ordering::SeqCst);
+                        let error = load_session_error.lock().expect("load error lock").take();
 
                         // Simulate spec-compliant history replay: send
                         // notifications to the client before responding to the
@@ -4669,18 +4880,21 @@ exit 7
                             ))?;
                         }
 
-                        // If a gate was installed, park on it before responding
-                        // so tests can interleave other work (e.g.
-                        // `close_session`) with an in-flight load.
                         let gate = load_session_gate
                             .lock()
                             .expect("load_session_gate mutex poisoned")
                             .take();
-                        if let Some(gate) = gate {
-                            gate.recv().await.ok();
-                        }
-
-                        responder.respond(acp::LoadSessionResponse::new())
+                        // Gated responses must not block ACP dispatch: tests need later
+                        // requests to reach the agent while this load is still in flight.
+                        cx.spawn(async move {
+                            if let Some(gate) = gate {
+                                gate.recv().await.log_err();
+                            }
+                            match error {
+                                Some(error) => responder.respond_with_error(error),
+                                None => responder.respond(acp::LoadSessionResponse::new()),
+                            }
+                        })
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -4704,7 +4918,14 @@ exit 7
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_notification(
-                async move |_notif: acp::CancelNotification, _cx| Ok(()),
+                async move |notification: acp::CancelNotification, _cx| {
+                    subagents
+                        .cancelled_sessions
+                        .lock()
+                        .expect("cancelled sessions lock")
+                        .push(notification.session_id);
+                    Ok(())
+                },
                 agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(agent_transport, async move |agent| {
@@ -4747,12 +4968,17 @@ exit 7
             .expect("failed to initialize ACP connection");
 
         let agent_capabilities = response.agent_capabilities;
+        let subagent_sessions = Rc::new(RefCell::new(ExternalSubagentSessions {
+            negotiated: supports_subagent_sessions(&agent_capabilities.meta),
+            ..Default::default()
+        }));
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            subagent_sessions: subagent_sessions.clone(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -4776,6 +5002,7 @@ exit 7
                 client_conn,
                 sessions,
                 agent_capabilities,
+                subagent_sessions,
                 request_elicitations,
                 agent_server_store,
                 client_io_task,
@@ -4799,6 +5026,752 @@ exit 7
             load_session_gate,
             keep_agent_alive,
         )
+    }
+
+    fn subagent_tool_meta(session_id: &str) -> acp::Meta {
+        acp::Meta::from_iter([(
+            SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::json!({ "session_id": session_id, "message_start_index": 0 }),
+        )])
+    }
+
+    fn subagent_info_update(parent: &str, tool: &str, status: &str) -> acp::SessionUpdate {
+        acp::SessionUpdate::SessionInfoUpdate(
+            acp::SessionInfoUpdate::new()
+                .title("Child task")
+                .meta(acp::Meta::from_iter([(
+                    acp_thread::SUBAGENT_SESSION_META_KEY.into(),
+                    serde_json::json!({
+                        "parent_session_id": parent,
+                        "parent_tool_call_id": tool,
+                        "status": status,
+                    }),
+                )])),
+        )
+    }
+
+    fn send_test_session_update(
+        connection: &AcpConnection,
+        session_id: &acp::SessionId,
+        update: acp::SessionUpdate,
+    ) {
+        enqueue_notification(
+            &connection.dispatch_tx,
+            acp::SessionNotification::new(session_id.clone(), update),
+            handle_session_notification,
+        );
+    }
+
+    #[test]
+    fn test_subagent_capability_negotiation_and_invalid_linkage() {
+        assert!(supports_subagent_sessions(
+            &client_capabilities_for_agent(&AgentId::new("pi"), false).meta
+        ));
+        assert!(!supports_subagent_sessions(&None));
+        for capability in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!({ "version": "1" }),
+            serde_json::json!({ "version": 2 }),
+        ] {
+            assert!(!supports_subagent_sessions(&Some(acp::Meta::from_iter([
+                (SUBAGENT_SESSIONS_CAPABILITY_META_KEY.into(), capability)
+            ]))));
+        }
+        let parent = acp::SessionId::new("parent");
+        let mut registry = ExternalSubagentSessions::default();
+        let mut update = acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("tool", "Child").meta(subagent_tool_meta("child")),
+        );
+        assert!(register_subagent_from_tool_update(&mut registry, &parent, &mut update).is_none());
+        assert!(registry.parents.is_empty());
+        let acp::SessionUpdate::ToolCall(tool) = update else {
+            panic!("expected tool")
+        };
+        assert!(subagent_session_info_from_meta(&tool.meta).is_none());
+
+        registry.negotiated = true;
+        for value in [
+            serde_json::json!({ "session_id": "child" }),
+            serde_json::json!({ "session_id": "child", "message_start_index": -1 }),
+            serde_json::json!({ "session_id": "child", "message_start_index": 1 }),
+            serde_json::json!({ "session_id": "", "message_start_index": 0 }),
+            serde_json::json!({ "session_id": "parent", "message_start_index": 0 }),
+        ] {
+            let mut update =
+                acp::SessionUpdate::ToolCall(acp::ToolCall::new("tool", "Child").meta(
+                    acp::Meta::from_iter([(SUBAGENT_SESSION_INFO_META_KEY.into(), value)]),
+                ));
+            assert!(
+                register_subagent_from_tool_update(&mut registry, &parent, &mut update).is_none()
+            );
+            assert!(registry.parents.is_empty());
+        }
+        let child = acp::SessionId::new("child");
+        let tool = acp::ToolCallId::new("tool");
+        registry
+            .register(&child, &parent, &tool)
+            .expect("register child");
+        registry
+            .register(&child, &parent, &tool)
+            .expect("idempotent linkage");
+        let grandchild = acp::SessionId::new("grandchild");
+        registry
+            .register(&grandchild, &child, &tool)
+            .expect("register grandchild");
+        assert!(registry.register(&parent, &grandchild, &tool).is_err());
+        assert!(registry.register(&child, &grandchild, &tool).is_err());
+        assert!(
+            registry
+                .register(&child, &parent, &acp::ToolCallId::new("other"))
+                .is_err()
+        );
+        assert!(
+            registry
+                .register(
+                    &acp::SessionId::new("other"),
+                    &parent,
+                    &acp::ToolCallId::new("")
+                )
+                .is_err()
+        );
+        for status in ["unknown", "cancelled", ""] {
+            let acp::SessionUpdate::SessionInfoUpdate(update) =
+                subagent_info_update("parent", "tool", status)
+            else {
+                panic!("expected info update")
+            };
+            assert!(external_subagent_session_info_from_meta(&update.meta).is_none());
+        }
+    }
+
+    #[gpui::test]
+    async fn test_external_subagent_capability_is_required(cx: &mut gpui::TestAppContext) {
+        for capability in [None, Some(serde_json::json!({ "version": 2 }))] {
+            let (connection, project, _, _, replay, _, _keep_agent_alive) =
+                connect_fake_agent_with_subagents(
+                    None,
+                    FakeSubagentOptions {
+                        capability,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .await;
+            replay.lock().expect("replay lock").extend([
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("tool", "Child").meta(subagent_tool_meta("child")),
+                ),
+                subagent_info_update("grandparent", "tool", "in_progress"),
+            ]);
+            let parent = cx
+                .update(|cx| {
+                    connection.clone().load_session(
+                        acp::SessionId::new("parent"),
+                        project,
+                        PathList::new(&[std::path::Path::new("/a")]),
+                        None,
+                        cx,
+                    )
+                })
+                .await
+                .expect("load unnegotiated session");
+            cx.run_until_parked();
+            assert!(!connection.subagent_sessions.borrow().negotiated);
+            assert!(connection.subagent_sessions.borrow().parents.is_empty());
+            parent.read_with(cx, |thread, _| {
+                assert!(thread.parent_session_id().is_none());
+                assert_eq!(thread.status(), acp_thread::ThreadStatus::Idle);
+                let Some(acp_thread::AgentThreadEntry::ToolCall(tool)) = thread.entries().first()
+                else {
+                    panic!("expected parent tool")
+                };
+                assert!(tool.subagent_session_info.is_none());
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_external_subagent_discovery_lifecycle_and_reopen(cx: &mut gpui::TestAppContext) {
+        let (connection, project, _, close_count, replay, _, _keep_agent_alive) =
+            connect_fake_agent_with_subagents(
+                None,
+                FakeSubagentOptions {
+                    capability: Some(serde_json::json!({ "version": 1 })),
+                    ..Default::default()
+                },
+                cx,
+            )
+            .await;
+        let parent_id = acp::SessionId::new("parent");
+        let child_id = acp::SessionId::new("child");
+        let work_dirs = PathList::new(&[std::path::Path::new("/a")]);
+        let parent = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    parent_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load parent");
+        let spawned = Rc::new(RefCell::new(Vec::new()));
+        let subscription = cx.update(|cx| {
+            cx.subscribe(&parent, {
+                let spawned = spawned.clone();
+                move |_, event, _| {
+                    if let acp_thread::AcpThreadEvent::SubagentSpawned(session_id) = event {
+                        spawned.borrow_mut().push(session_id.clone());
+                    }
+                }
+            })
+        });
+        let parent_update = acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("tool", "Child").meta(subagent_tool_meta("child")),
+        );
+        send_test_session_update(&connection, &parent_id, parent_update.clone());
+        send_test_session_update(
+            &connection,
+            &parent_id,
+            acp::SessionUpdate::ToolCallUpdate(
+                acp::ToolCallUpdate::new("tool", acp::ToolCallUpdateFields::new())
+                    .meta(subagent_tool_meta("child")),
+            ),
+        );
+        send_test_session_update(
+            &connection,
+            &child_id,
+            subagent_info_update("parent", "tool", "completed"),
+        );
+        send_test_session_update(
+            &connection,
+            &acp::SessionId::new("unknown"),
+            subagent_info_update("parent", "other", "in_progress"),
+        );
+        cx.run_until_parked();
+        assert_eq!(*spawned.borrow(), vec![child_id.clone()]);
+        assert_eq!(connection.sessions.borrow().len(), 1);
+        assert_eq!(connection.subagent_sessions.borrow().parents.len(), 1);
+
+        replay.lock().expect("replay lock").extend([
+            subagent_info_update("parent", "tool", "in_progress"),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Live output".into())),
+        ]);
+        let load = cx.update(|cx| {
+            connection.clone().load_session(
+                child_id.clone(),
+                project.clone(),
+                work_dirs.clone(),
+                None,
+                cx,
+            )
+        });
+        let child = connection
+            .sessions
+            .borrow()
+            .get(&child_id)
+            .and_then(|session| session.thread.upgrade())
+            .expect("registered before replay");
+        child.read_with(cx, |thread, _| {
+            assert_eq!(thread.parent_session_id(), Some(&parent_id));
+            assert_eq!(thread.status(), acp_thread::ThreadStatus::Generating);
+        });
+        assert_eq!(load.await.expect("load child"), child);
+        cx.run_until_parked();
+        child.read_with(cx, |thread, cx| {
+            assert_eq!(thread.title().as_deref(), Some("Child task"));
+            assert_eq!(thread.status(), acp_thread::ThreadStatus::Generating);
+            assert!(thread.to_markdown(cx).contains("Live output"));
+        });
+        send_test_session_update(
+            &connection,
+            &child_id,
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(" and completion".into())),
+        );
+        send_test_session_update(
+            &connection,
+            &child_id,
+            subagent_info_update("parent", "wrong-tool", "failed"),
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            child.read_with(cx, |thread, _| thread.status()),
+            acp_thread::ThreadStatus::Generating
+        );
+        send_test_session_update(
+            &connection,
+            &child_id,
+            subagent_info_update("parent", "tool", "completed"),
+        );
+        cx.run_until_parked();
+        child.read_with(cx, |thread, cx| {
+            assert_eq!(thread.status(), acp_thread::ThreadStatus::Idle);
+            assert!(!thread.had_error());
+            assert!(
+                thread
+                    .to_markdown(cx)
+                    .contains("Live output and completion")
+            );
+        });
+        let first_child_id = child.entity_id();
+        drop(child);
+        release_dropped_entities(cx);
+        assert_eq!(close_count.load(Ordering::SeqCst), 1);
+        assert!(!connection.sessions.borrow().contains_key(&child_id));
+        assert!(!connection.pending_sessions.borrow().contains_key(&child_id));
+        assert!(connection.sessions.borrow().contains_key(&parent_id));
+        replay.lock().expect("replay lock").extend([
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Saved output".into())),
+            subagent_info_update("parent", "tool", "completed"),
+        ]);
+        let child = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    child_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("reopen child");
+        cx.run_until_parked();
+        assert_ne!(child.entity_id(), first_child_id);
+        child.read_with(cx, |thread, cx| {
+            assert_eq!(thread.parent_session_id(), Some(&parent_id));
+            assert_eq!(thread.status(), acp_thread::ThreadStatus::Idle);
+            assert!(thread.to_markdown(cx).contains("Saved output"));
+        });
+
+        drop(subscription);
+        let first_parent_id = parent.entity_id();
+        drop(parent);
+        release_dropped_entities(cx);
+        assert_eq!(close_count.load(Ordering::SeqCst), 2);
+        assert!(!connection.sessions.borrow().contains_key(&parent_id));
+        assert!(
+            !connection
+                .pending_sessions
+                .borrow()
+                .contains_key(&parent_id)
+        );
+        assert!(connection.sessions.borrow().contains_key(&child_id));
+        replay
+            .lock()
+            .expect("replay lock")
+            .extend([parent_update.clone(), parent_update]);
+        let load = cx.update(|cx| {
+            connection
+                .clone()
+                .load_session(parent_id.clone(), project, work_dirs, None, cx)
+        });
+        let parent = connection
+            .sessions
+            .borrow()
+            .get(&parent_id)
+            .and_then(|session| session.thread.upgrade())
+            .expect("registered parent");
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&parent, {
+                let spawned = spawned.clone();
+                move |_, event, _| {
+                    if let acp_thread::AcpThreadEvent::SubagentSpawned(session_id) = event {
+                        spawned.borrow_mut().push(session_id.clone());
+                    }
+                }
+            })
+        });
+        load.await.expect("reopen parent");
+        cx.run_until_parked();
+        assert_ne!(parent.entity_id(), first_parent_id);
+        assert_eq!(*spawned.borrow(), vec![child_id.clone(), child_id]);
+        parent.read_with(cx, |thread, _| {
+            let Some(acp_thread::AgentThreadEntry::ToolCall(tool)) = thread.entries().first()
+            else {
+                panic!("expected retained parent tool")
+            };
+            assert!(tool.subagent_session_info.is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_subagent_failed_load_retries_on_later_metadata(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let load_session_error = Arc::new(Mutex::new(None));
+        let (connection, project, load_count, _, replay, load_session_gate, _keep_agent_alive) =
+            connect_fake_agent_with_subagents(
+                None,
+                FakeSubagentOptions {
+                    capability: Some(serde_json::json!({ "version": 1 })),
+                    load_session_error: load_session_error.clone(),
+                    ..Default::default()
+                },
+                cx,
+            )
+            .await;
+        let parent_id = acp::SessionId::new("parent");
+        let child_id = acp::SessionId::new("child");
+        let work_dirs = PathList::new(&[std::path::Path::new("/a")]);
+        let parent = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    parent_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load parent");
+        let loads = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&parent, {
+                let loads = loads.clone();
+                let connection = connection.clone();
+                move |_, event, cx| {
+                    if let acp_thread::AcpThreadEvent::SubagentSpawned(session_id) = event {
+                        loads.borrow_mut().push(connection.clone().load_session(
+                            session_id.clone(),
+                            project.clone(),
+                            work_dirs.clone(),
+                            None,
+                            cx,
+                        ));
+                    }
+                }
+            })
+        });
+        let metadata_update = acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new("tool", acp::ToolCallUpdateFields::new())
+                .meta(subagent_tool_meta("child")),
+        );
+        let (failure_sender, failure_receiver) = async_channel::bounded(1);
+        *load_session_gate.lock().expect("load gate lock") = Some(failure_receiver);
+        *load_session_error.lock().expect("load error lock") =
+            Some(acp::Error::internal_error().data("transient child load failure"));
+        send_test_session_update(
+            &connection,
+            &parent_id,
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("tool", "Child").meta(subagent_tool_meta("child")),
+            ),
+        );
+        cx.run_until_parked();
+        assert_eq!(load_count.load(Ordering::SeqCst), 2);
+        send_test_session_update(&connection, &parent_id, metadata_update.clone());
+        cx.run_until_parked();
+        assert_eq!(loads.borrow().len(), 1, "no duplicate while loading");
+        assert_eq!(load_count.load(Ordering::SeqCst), 2);
+
+        failure_sender.send(()).await.expect("release failed load");
+        let failed_load = loads
+            .borrow_mut()
+            .pop()
+            .expect("first discovery loads child");
+        assert!(failed_load.await.is_err());
+        cx.run_until_parked();
+        assert!(
+            loads.borrow().is_empty(),
+            "failure must not retry on its own"
+        );
+        assert_eq!(load_count.load(Ordering::SeqCst), 2);
+        assert!(!connection.sessions.borrow().contains_key(&child_id));
+        assert!(!connection.pending_sessions.borrow().contains_key(&child_id));
+
+        replay.lock().expect("replay lock").extend([
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Recovered child".into())),
+            subagent_info_update("parent", "tool", "completed"),
+        ]);
+        let (retry_sender, retry_receiver) = async_channel::bounded(1);
+        *load_session_gate.lock().expect("load gate lock") = Some(retry_receiver);
+        send_test_session_update(&connection, &parent_id, metadata_update.clone());
+        cx.run_until_parked();
+        assert_eq!(loads.borrow().len(), 1, "later metadata retries discovery");
+        assert_eq!(load_count.load(Ordering::SeqCst), 3);
+        send_test_session_update(&connection, &parent_id, metadata_update.clone());
+        cx.run_until_parked();
+        assert_eq!(loads.borrow().len(), 1, "no duplicate while retrying");
+        assert_eq!(load_count.load(Ordering::SeqCst), 3);
+        retry_sender
+            .send(())
+            .await
+            .expect("release successful retry");
+        let retry = loads.borrow_mut().pop().expect("retry loads child");
+        let child = retry.await.expect("child retry succeeds");
+        cx.run_until_parked();
+        child.read_with(cx, |thread, cx| {
+            assert_eq!(thread.parent_session_id(), Some(&parent_id));
+            assert_eq!(thread.status(), acp_thread::ThreadStatus::Idle);
+            assert!(thread.to_markdown(cx).contains("Recovered child"));
+        });
+        send_test_session_update(&connection, &parent_id, metadata_update);
+        cx.run_until_parked();
+        assert!(loads.borrow().is_empty(), "success stays announced");
+        assert_eq!(load_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            connection
+                .subagent_sessions
+                .borrow()
+                .parents
+                .get(&child_id)
+                .expect("child linkage")
+                .announced_for,
+            Some(parent.entity_id())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_superseded_subagent_load_failure_preserves_announcement(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for replacement_pending in [true, false] {
+            let load_session_error = Arc::new(Mutex::new(None));
+            let (connection, project, load_count, _, _, load_session_gate, _keep_agent_alive) =
+                connect_fake_agent_with_subagents(
+                    None,
+                    FakeSubagentOptions {
+                        capability: Some(serde_json::json!({ "version": 1 })),
+                        load_session_error: load_session_error.clone(),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .await;
+            let parent_id = acp::SessionId::new("parent");
+            let child_id = acp::SessionId::new("child");
+            let work_dirs = PathList::new(&[std::path::Path::new("/a")]);
+            let parent = cx
+                .update(|cx| {
+                    connection.clone().load_session(
+                        parent_id.clone(),
+                        project.clone(),
+                        work_dirs.clone(),
+                        None,
+                        cx,
+                    )
+                })
+                .await
+                .expect("load parent");
+            let spawned = Rc::new(RefCell::new(Vec::new()));
+            let _subscription = cx.update(|cx| {
+                cx.subscribe(&parent, {
+                    let spawned = spawned.clone();
+                    move |_, event, _| {
+                        if let acp_thread::AcpThreadEvent::SubagentSpawned(session_id) = event {
+                            spawned.borrow_mut().push(session_id.clone());
+                        }
+                    }
+                })
+            });
+            send_test_session_update(
+                &connection,
+                &parent_id,
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("tool", "Child").meta(subagent_tool_meta("child")),
+                ),
+            );
+            cx.run_until_parked();
+            let (failure_sender, failure_receiver) = async_channel::bounded(1);
+            *load_session_gate.lock().expect("load gate lock") = Some(failure_receiver);
+            *load_session_error.lock().expect("load error lock") =
+                Some(acp::Error::internal_error().data("superseded child load failure"));
+            let failed_load = cx.update(|cx| {
+                connection.clone().load_session(
+                    child_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            assert_eq!(load_count.load(Ordering::SeqCst), 2);
+            let first_thread_id = connection
+                .pending_sessions
+                .borrow()
+                .get(&child_id)
+                .expect("pending first load")
+                .thread
+                .entity_id();
+            // Force supersession to exercise stale cleanup independently of load serialization.
+            connection.remove_session(&child_id, first_thread_id);
+            assert!(connection.remove_pending_session(&child_id, first_thread_id));
+            let (replacement_sender, replacement_receiver) = async_channel::bounded(1);
+            if replacement_pending {
+                *load_session_gate.lock().expect("load gate lock") = Some(replacement_receiver);
+            }
+            let replacement = cx.update(|cx| {
+                connection
+                    .clone()
+                    .load_session(child_id.clone(), project, work_dirs, None, cx)
+            });
+            cx.run_until_parked();
+            assert_eq!(load_count.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                connection.pending_sessions.borrow().contains_key(&child_id),
+                replacement_pending
+            );
+            failure_sender
+                .send(())
+                .await
+                .expect("release stale failure");
+            assert!(failed_load.await.is_err());
+            cx.run_until_parked();
+            assert_eq!(
+                connection.pending_sessions.borrow().contains_key(&child_id),
+                replacement_pending
+            );
+            send_test_session_update(
+                &connection,
+                &parent_id,
+                acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new("tool", acp::ToolCallUpdateFields::new())
+                        .meta(subagent_tool_meta("child")),
+                ),
+            );
+            cx.run_until_parked();
+            assert_eq!(*spawned.borrow(), vec![child_id.clone()]);
+            if replacement_pending {
+                replacement_sender
+                    .send(())
+                    .await
+                    .expect("release replacement");
+            }
+            let child = replacement.await.expect("replacement succeeds");
+            assert_ne!(child.entity_id(), first_thread_id);
+            assert_eq!(
+                connection
+                    .sessions
+                    .borrow()
+                    .get(&child_id)
+                    .expect("replacement remains registered")
+                    .thread
+                    .entity_id(),
+                child.entity_id()
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_external_subagent_cancel_and_connection_failure(cx: &mut gpui::TestAppContext) {
+        let cancelled_sessions = Arc::new(Mutex::new(Vec::new()));
+        let (connection, project, _, _, replay, _, _keep_agent_alive) =
+            connect_fake_agent_with_subagents(
+                None,
+                FakeSubagentOptions {
+                    capability: Some(serde_json::json!({ "version": 1 })),
+                    cancelled_sessions: cancelled_sessions.clone(),
+                    ..Default::default()
+                },
+                cx,
+            )
+            .await;
+        let work_dirs = PathList::new(&[std::path::Path::new("/a")]);
+        let parent_id = acp::SessionId::new("parent");
+        let child_id = acp::SessionId::new("child");
+        let parent = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    parent_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load parent");
+        replay.lock().expect("replay lock").extend([
+            subagent_info_update("parent", "tool", "pending"),
+            acp::SessionUpdate::ToolCall(acp::ToolCall::new("child-tool", "Pending work")),
+        ]);
+        let child = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    child_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load child directly");
+        cx.run_until_parked();
+        child.read_with(cx, |thread, _| {
+            assert_eq!(thread.parent_session_id(), Some(&parent_id));
+            assert_eq!(thread.status(), acp_thread::ThreadStatus::Generating);
+        });
+        replay
+            .lock()
+            .expect("replay lock")
+            .push(subagent_info_update(
+                "parent",
+                "sibling-tool",
+                "in_progress",
+            ));
+        let sibling_id = acp::SessionId::new("sibling");
+        let sibling = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .load_session(sibling_id.clone(), project, work_dirs, None, cx)
+            })
+            .await
+            .expect("load sibling");
+        cx.run_until_parked();
+        child.update(cx, |thread, cx| thread.cancel(cx)).await;
+        cx.run_until_parked();
+        assert_eq!(
+            *cancelled_sessions.lock().expect("cancelled sessions lock"),
+            vec![child_id.clone()]
+        );
+        assert_eq!(
+            parent.read_with(cx, |thread, _| thread.status()),
+            acp_thread::ThreadStatus::Idle
+        );
+        assert_eq!(
+            sibling.read_with(cx, |thread, _| thread.status()),
+            acp_thread::ThreadStatus::Generating
+        );
+        send_test_session_update(
+            &connection,
+            &child_id,
+            subagent_info_update("parent", "tool", "in_progress"),
+        );
+        send_test_session_update(
+            &connection,
+            &child_id,
+            subagent_info_update("parent", "tool", "failed"),
+        );
+        cx.run_until_parked();
+        child.read_with(cx, |thread, _| {
+            assert_eq!(thread.status(), acp_thread::ThreadStatus::Idle);
+            assert!(!thread.had_error());
+            let Some(acp_thread::AgentThreadEntry::ToolCall(tool)) = thread.entries().first()
+            else {
+                panic!("expected child tool")
+            };
+            assert!(matches!(tool.status(), acp_thread::ToolCallStatus::Canceled));
+        });
+        assert!(
+            connection
+                .dispatch_tx
+                .unbounded_send(Box::new(ConnectionClosedForegroundWork))
+                .is_ok()
+        );
+        cx.run_until_parked();
+        sibling.read_with(cx, |thread, _| {
+            assert_eq!(thread.status(), acp_thread::ThreadStatus::Idle);
+            assert!(thread.had_error());
+        });
     }
 
     #[gpui::test]
@@ -6191,8 +7164,47 @@ fn handle_read_text_file(
     .detach();
 }
 
+fn register_subagent_from_tool_update(
+    subagent_sessions: &mut ExternalSubagentSessions,
+    parent_session_id: &acp::SessionId,
+    update: &mut acp::SessionUpdate,
+) -> Option<acp::SessionId> {
+    let (tool_call_id, meta) = match update {
+        acp::SessionUpdate::ToolCall(tool_call) => (&tool_call.tool_call_id, &mut tool_call.meta),
+        acp::SessionUpdate::ToolCallUpdate(tool_call) => {
+            (&tool_call.tool_call_id, &mut tool_call.meta)
+        }
+        _ => return None,
+    };
+    if !meta
+        .as_ref()
+        .is_some_and(|meta| meta.contains_key(SUBAGENT_SESSION_INFO_META_KEY))
+    {
+        return None;
+    }
+    let registration = subagent_session_info_from_meta(meta)
+        .filter(|info| info.message_start_index == 0)
+        .ok_or_else(|| anyhow!("invalid subagent session metadata"))
+        .and_then(|info| {
+            subagent_sessions.register(&info.session_id, parent_session_id, tool_call_id)?;
+            Ok(info.session_id)
+        });
+    match registration {
+        Ok(session_id) => Some(session_id),
+        Err(error) => {
+            log::warn!("Ignoring external subagent linkage: {error}");
+            // The conversation also discovers children by scanning retained tool metadata.
+            // Do not let that replay path bypass negotiation or linkage validation.
+            if let Some(meta) = meta {
+                meta.remove(SUBAGENT_SESSION_INFO_META_KEY);
+            }
+            None
+        }
+    }
+}
+
 fn handle_session_notification(
-    notification: acp::SessionNotification,
+    mut notification: acp::SessionNotification,
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
@@ -6253,6 +7265,47 @@ fn handle_session_notification(
         return;
     };
 
+    let subagent_session_id = register_subagent_from_tool_update(
+        &mut ctx.subagent_sessions.borrow_mut(),
+        &notification.session_id,
+        &mut notification.update,
+    );
+    if let Some(session_id) = &subagent_session_id {
+        let child = ctx
+            .sessions
+            .borrow()
+            .get(session_id)
+            .map(|session| session.thread.clone());
+        if let Some(child) = child {
+            child
+                .update(cx, |child, cx| {
+                    if child.parent_session_id().is_none() {
+                        child.set_parent_session_id(notification.session_id.clone(), cx);
+                        child.set_external_subagent_status(ExternalSubagentStatus::Pending, cx);
+                    }
+                })
+                .log_err();
+        }
+    }
+    let subagent_sessions_negotiated = ctx.subagent_sessions.borrow().negotiated;
+    let subagent_info = if subagent_sessions_negotiated
+        && let acp::SessionUpdate::SessionInfoUpdate(update) = &notification.update
+    {
+        external_subagent_session_info_from_meta(&update.meta).filter(|info| {
+            ctx.subagent_sessions
+                .borrow_mut()
+                .register(
+                    &notification.session_id,
+                    &info.parent_session_id,
+                    &info.parent_tool_call_id,
+                )
+                .log_err()
+                .is_some()
+        })
+    } else {
+        None
+    };
+
     // Pre-handle: if a ToolCall carries terminal_info, create/register a display-only terminal.
     if let acp::SessionUpdate::ToolCall(tc) = &notification.update {
         if let Some(meta) = &tc.meta {
@@ -6294,7 +7347,12 @@ fn handle_session_notification(
     // Forward the update to the acp_thread as usual.
     if let Err(err) = thread
         .update(cx, |thread, cx| {
-            thread.handle_session_update(notification.update.clone(), cx)
+            thread.handle_session_update(notification.update.clone(), cx)?;
+            if let Some(info) = subagent_info {
+                thread.set_parent_session_id(info.parent_session_id, cx);
+                thread.set_external_subagent_status(info.status, cx);
+            }
+            anyhow::Ok(())
         })
         .flatten_acp()
     {
@@ -6302,6 +7360,16 @@ fn handle_session_notification(
             "Failed to handle session update for {:?}: {err:?}",
             notification.session_id
         );
+    } else if let Some(session_id) = subagent_session_id {
+        let should_announce = ctx
+            .subagent_sessions
+            .borrow_mut()
+            .should_announce(&session_id, thread.entity_id());
+        if should_announce {
+            thread
+                .update(cx, |thread, cx| thread.subagent_spawned(session_id, cx))
+                .log_err();
+        }
     }
 
     // Post-handle: stream terminal output/exit if present on ToolCallUpdate meta.

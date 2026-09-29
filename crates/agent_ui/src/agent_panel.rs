@@ -4089,6 +4089,28 @@ impl AgentPanel {
         })
     }
 
+    pub fn navigate_to_session(
+        &mut self,
+        thread_id: ThreadId,
+        session_id: acp::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(conversation) = self.conversation_view_for_id(&thread_id, cx).cloned() else {
+            return false;
+        };
+        if conversation.read(cx).thread_view(&session_id).is_none() {
+            return false;
+        }
+        if self.active_thread_id(cx) != Some(thread_id) {
+            self.activate_retained_thread(thread_id, true, window, cx);
+        }
+        conversation.update(cx, |conversation, cx| {
+            conversation.navigate_to_thread(session_id, window, cx);
+        });
+        true
+    }
+
     pub fn regenerate_thread_title(
         &mut self,
         thread_id: ThreadId,
@@ -4159,10 +4181,8 @@ impl AgentPanel {
 
         for conversation_view in conversation_views {
             if *thread_id == conversation_view.read(cx).thread_id {
-                if let Some(thread_view) = conversation_view.read(cx).root_thread_view() {
-                    thread_view.update(cx, |view, cx| view.cancel_generation(cx));
-                    return true;
-                }
+                conversation_view.update(cx, |view, cx| view.cancel_all_generation(cx));
+                return true;
             }
         }
         false
@@ -4286,7 +4306,7 @@ impl AgentPanel {
             .iter()
             .filter(|(_id, view)| {
                 let view = view.read(cx);
-                if view.has_pending_selections() {
+                if view.has_pending_selections() || view.is_busy(cx) {
                     return false;
                 }
                 let Some(thread_view) = view.root_thread_view() else {
@@ -11762,6 +11782,84 @@ mod tests {
                 "a retained thread should unload when its turn completes"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_retained_threads_preserves_busy_children(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 0,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        for external_status in [false, true] {
+            let connection = StubAgentConnection::new()
+                .with_supports_load_session(true)
+                .with_agent_id(AgentId::new(format!("busy-child-{external_status}")));
+            let (root_session, root_id) =
+                open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+            connection.end_turn(root_session, acp::StopReason::EndTurn);
+            cx.run_until_parked();
+            let root = panel.read_with(&cx, |panel, cx| {
+                panel.active_agent_thread(cx).expect("root")
+            });
+            let child_session = acp::SessionId::new("busy-child");
+            root.update(&mut cx, |thread, cx| {
+                thread.subagent_spawned(child_session.clone(), cx)
+            });
+            cx.run_until_parked();
+            let child = panel.read_with(&cx, |panel, cx| {
+                panel
+                    .active_conversation_view()
+                    .expect("conversation")
+                    .read(cx)
+                    .thread_view(&child_session)
+                    .expect("child")
+                    .read(cx)
+                    .thread
+                    .clone()
+            });
+            let prompt_task = if external_status {
+                child.update(&mut cx, |thread, cx| {
+                    thread.set_external_subagent_status(
+                        acp_thread::ExternalSubagentStatus::InProgress,
+                        cx,
+                    )
+                });
+                None
+            } else {
+                let prompt = child.update(&mut cx, |thread, cx| thread.send_raw("Work", cx));
+                Some(cx.update(|_, cx| cx.spawn(async move |_| prompt.await)))
+            };
+            cx.run_until_parked();
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+            panel.update(&mut cx, |panel, cx| {
+                panel.cleanup_retained_threads(cx);
+                assert!(panel.is_retained_thread(&root_id));
+            });
+            if external_status {
+                child.update(&mut cx, |thread, cx| {
+                    thread.set_external_subagent_status(
+                        acp_thread::ExternalSubagentStatus::Completed,
+                        cx,
+                    )
+                });
+            } else {
+                connection.end_turn(child_session, acp::StopReason::EndTurn);
+            }
+            if let Some(prompt_task) = prompt_task {
+                prompt_task.await.expect("child prompt completes");
+            }
+            cx.run_until_parked();
+            panel.update(&mut cx, |panel, cx| {
+                panel.cleanup_retained_threads(cx);
+                assert!(!panel.is_retained_thread(&root_id));
+            });
+        }
     }
 
     #[gpui::test]

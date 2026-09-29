@@ -846,6 +846,42 @@ impl ConversationView {
         })
     }
 
+    pub fn is_busy(&self, cx: &App) -> bool {
+        self.is_loading()
+            || self.has_busy_subagents(cx)
+            || self.root_thread(cx).is_some_and(|thread| {
+                let thread = thread.read(cx);
+                thread.status() == ThreadStatus::Generating || thread.is_waiting_for_confirmation()
+            })
+    }
+
+    pub fn has_busy_subagents(&self, cx: &App) -> bool {
+        self.as_connected().is_some_and(|connected| {
+            !connected.loading_subagents.is_empty()
+                || connected.threads.iter().any(|(session_id, view)| {
+                    if Some(session_id) == self.root_session_id.as_ref() {
+                        return false;
+                    }
+                    let thread = view.read(cx).thread.read(cx);
+                    thread.status() == ThreadStatus::Generating
+                        || thread.is_waiting_for_confirmation()
+                })
+        })
+    }
+
+    pub fn cancel_all_generation(&self, cx: &mut App) {
+        if let Some(connected) = self.as_connected() {
+            for view in connected.threads.values() {
+                let thread = view.read(cx).thread.read(cx);
+                if thread.status() == ThreadStatus::Generating
+                    || thread.is_waiting_for_confirmation()
+                {
+                    view.update(cx, |view, cx| view.cancel_generation(cx));
+                }
+            }
+        }
+    }
+
     pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
         self.root_thread_view()
             .map(|view| view.read(cx).thread.clone())
@@ -860,6 +896,45 @@ impl ConversationView {
     pub fn thread_view(&self, session_id: &acp_v1::SessionId) -> Option<Entity<ThreadView>> {
         let connected = self.as_connected()?;
         connected.threads.get(session_id).cloned()
+    }
+
+    pub fn child_threads(
+        &self,
+        parent_session_id: &acp_v1::SessionId,
+        cx: &App,
+    ) -> Vec<Entity<ThreadView>> {
+        let Some(connected) = self.as_connected() else {
+            return Vec::new();
+        };
+        let Some(parent) = connected.threads.get(parent_session_id) else {
+            return Vec::new();
+        };
+        let mut seen = HashSet::default();
+        seen.insert(parent_session_id.clone());
+        let mut children = Vec::new();
+        for entry in parent.read(cx).thread.read(cx).entries() {
+            if let AgentThreadEntry::ToolCall(call) = entry
+                && let Some(info) = &call.subagent_session_info
+                && let Some(child) = connected.threads.get(&info.session_id)
+                && child.read(cx).thread.read(cx).parent_session_id() == Some(parent_session_id)
+                && seen.insert(info.session_id.clone())
+            {
+                children.push(child.clone());
+            }
+        }
+        // A spawn event can precede its tool-call metadata. Keep these children
+        // visible, with a stable fallback order until the metadata arrives.
+        let mut remaining: Vec<_> = connected
+            .threads
+            .iter()
+            .filter(|(session_id, child)| {
+                !seen.contains(*session_id)
+                    && child.read(cx).thread.read(cx).parent_session_id() == Some(parent_session_id)
+            })
+            .collect();
+        remaining.sort_by(|(left, _), (right, _)| left.0.cmp(&right.0));
+        children.extend(remaining.into_iter().map(|(_, child)| child.clone()));
+        children
     }
 
     pub fn as_connected(&self) -> Option<&ConnectedServerState> {
@@ -926,6 +1001,7 @@ pub struct ConnectedServerState {
     auth_state: AuthState,
     active_id: Option<acp_v1::SessionId>,
     pub(crate) threads: HashMap<acp_v1::SessionId, Entity<ThreadView>>,
+    loading_subagents: HashMap<acp_v1::SessionId, Task<()>>,
     connection: Rc<dyn AgentConnection>,
     conversation: Entity<Conversation>,
     _connection_entry_subscription: Subscription,
@@ -956,8 +1032,10 @@ impl ConnectedServerState {
     }
 
     pub fn has_thread_error(&self, cx: &App) -> bool {
-        self.active_view()
-            .map_or(false, |view| view.read(cx).thread_error.is_some())
+        self.threads.values().any(|view| {
+            let view = view.read(cx);
+            view.parent_session_id.is_none() && view.thread_error.is_some()
+        })
     }
 
     pub fn navigate_to_thread(&mut self, session_id: acp_v1::SessionId) {
@@ -1404,6 +1482,7 @@ impl ConversationView {
                                 auth_state: AuthState::Ok,
                                 active_id: Some(root_session_id.clone()),
                                 threads: HashMap::from_iter([(root_session_id, current)]),
+                                loading_subagents: HashMap::default(),
                                 conversation,
                                 _connection_entry_subscription: connection_entry_subscription,
                                 _request_elicitation_subscription: request_elicitation_subscription,
@@ -1566,7 +1645,7 @@ impl ConversationView {
                     }
                 })
             })
-            .detach();
+            .detach_and_log_err(cx);
         }
 
         let profile_selector: Option<Rc<agent::NativeAgentConnection>> =
@@ -1670,6 +1749,7 @@ impl ConversationView {
                         auth_state,
                         active_id: None,
                         threads: HashMap::default(),
+                        loading_subagents: HashMap::default(),
                         connection,
                         conversation: cx.new(|_cx| Conversation::default()),
                         _connection_entry_subscription: Subscription::new(|| {}),
@@ -1928,6 +2008,7 @@ impl ConversationView {
                             thread.mark_as_subagent_output(cx);
                         });
                     }
+                    cx.notify();
                     return;
                 }
 
@@ -2044,6 +2125,19 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::LoadError(error) => {
+                if is_subagent {
+                    log::error!("Failed to load subagent {session_id}: {error:?}");
+                    if let Some(view) = self.thread_view(&session_id) {
+                        view.update(cx, |view, cx| {
+                            view.handle_thread_error(
+                                anyhow!("Failed to load subagent: {error:?}"),
+                                cx,
+                            );
+                        });
+                    }
+                    cx.notify();
+                    return;
+                }
                 if let Some(view) = self.root_thread_view() {
                     if view
                         .read(cx)
@@ -2062,7 +2156,12 @@ impl ConversationView {
                 );
             }
             AcpThreadEvent::TitleUpdated => {
-                let title = self.title_override(cx).or_else(|| thread.read(cx).title());
+                let override_title = if is_subagent {
+                    None
+                } else {
+                    self.title_override(cx)
+                };
+                let title = override_title.or_else(|| thread.read(cx).title());
                 if let Some(title) = title
                     && let Some(active_thread) = self.thread_view(&session_id)
                 {
@@ -2330,6 +2429,7 @@ impl ConversationView {
             return;
         };
         if connected.threads.contains_key(&subagent_id)
+            || connected.loading_subagents.contains_key(&subagent_id)
             || !connected.connection.supports_load_session()
         {
             return;
@@ -2346,35 +2446,78 @@ impl ConversationView {
             .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
 
         let subagent_thread_task = connected.connection.clone().load_session(
-            subagent_id,
+            subagent_id.clone(),
             self.project.clone(),
             work_dirs,
             None,
             cx,
         );
 
-        cx.spawn_in(window, async move |this, cx| {
-            let subagent_thread = subagent_thread_task.await?;
-            this.update_in(cx, |this, window, cx| {
-                let Some(conversation) = this
-                    .as_connected()
-                    .map(|connected| connected.conversation.clone())
-                else {
-                    return;
-                };
-                let subagent_session_id = subagent_thread.read(cx).session_id().clone();
-                conversation.update(cx, |conversation, cx| {
-                    conversation.register_thread(subagent_thread.clone(), cx);
-                });
-                let view =
-                    this.new_thread_view(subagent_thread, conversation, false, None, window, cx);
-                let Some(connected) = this.as_connected_mut() else {
-                    return;
-                };
-                connected.threads.insert(subagent_session_id, view);
-            })
-        })
-        .detach();
+        let load_task = cx.spawn_in(window, {
+            let subagent_id = subagent_id.clone();
+            async move |this, cx| {
+                let result = subagent_thread_task.await;
+                this.update_in(cx, |this, window, cx| {
+                    let Some(connected) = this.as_connected_mut() else {
+                        return;
+                    };
+                    connected.loading_subagents.remove(&subagent_id);
+                    let conversation = connected.conversation.clone();
+                    let subagent_thread = match result {
+                        Ok(thread) => thread,
+                        Err(error) => {
+                            log::error!("Failed to load subagent {subagent_id}: {error:#}");
+                            if let Some(parent) = this.thread_view(&parent_session_id) {
+                                parent.read(cx).thread.clone().update(cx, |thread, cx| {
+                                    thread
+                                        .handle_session_update(
+                                            acp_v1::SessionUpdate::Notice(
+                                                acp_v1::Notice::new(
+                                                    acp_v1::NoticeSeverity::Error,
+                                                    "Failed to load subagent conversation",
+                                                )
+                                                .description(error.to_string()),
+                                            ),
+                                            cx,
+                                        )
+                                        .log_err();
+                                });
+                            }
+                            cx.notify();
+                            return;
+                        }
+                    };
+                    if connected.threads.contains_key(&subagent_id) {
+                        return;
+                    }
+                    if subagent_thread.read(cx).parent_session_id().is_none() {
+                        subagent_thread.update(cx, |thread, cx| {
+                            thread.set_parent_session_id(parent_session_id, cx);
+                        });
+                    }
+                    let subagent_session_id = subagent_thread.read(cx).session_id().clone();
+                    conversation.update(cx, |conversation, cx| {
+                        conversation.register_thread(subagent_thread.clone(), cx);
+                    });
+                    let view = this.new_thread_view(
+                        subagent_thread,
+                        conversation,
+                        false,
+                        None,
+                        window,
+                        cx,
+                    );
+                    if let Some(connected) = this.as_connected_mut() {
+                        connected.threads.insert(subagent_session_id, view);
+                    }
+                    cx.notify();
+                })
+                .log_err();
+            }
+        });
+        if let Some(connected) = self.as_connected_mut() {
+            connected.loading_subagents.insert(subagent_id, load_task);
+        }
     }
 
     fn spawn_external_agent_login(
@@ -5190,6 +5333,354 @@ pub(crate) mod tests {
             assert_eq!(view.list_state.item_count(), 0);
             assert!(view.thread.read(cx).notices().is_empty());
         });
+    }
+
+    #[gpui::test]
+    async fn test_subagent_loads_are_deduplicated_and_do_not_update_root_metadata(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let root_session_id = conversation_view.read_with(cx, |view, _| {
+            view.root_session_id.clone().expect("root session")
+        });
+        let child_session_id = acp_v1::SessionId::new("deduplicated-child");
+        let metadata_updates = Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&conversation_view, {
+                let metadata_updates = metadata_updates.clone();
+                move |_, _: &RootThreadUpdated, _| {
+                    metadata_updates.set(metadata_updates.get() + 1);
+                }
+            })
+        });
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            for _ in 0..3 {
+                view.load_subagent_session(
+                    child_session_id.clone(),
+                    root_session_id.clone(),
+                    window,
+                    cx,
+                );
+            }
+            let connected = view.as_connected().expect("connected");
+            assert_eq!(connected.loading_subagents.len(), 1);
+            assert_eq!(connected.threads.len(), 1);
+            assert!(view.has_busy_subagents(cx));
+            assert!(view.is_busy(cx));
+        });
+        cx.run_until_parked();
+        let child = conversation_view.read_with(cx, |view, cx| {
+            let connected = view.as_connected().expect("connected");
+            assert!(connected.loading_subagents.is_empty());
+            assert_eq!(connected.threads.len(), 2);
+            assert_eq!(view.child_threads(&root_session_id, cx).len(), 1);
+            assert!(!view.has_busy_subagents(cx));
+            assert!(!view.is_busy(cx));
+            let child = view.thread_view(&child_session_id).expect("loaded child");
+            assert_eq!(
+                child.read(cx).parent_session_id.as_ref(),
+                Some(&root_session_id)
+            );
+            child
+        });
+        cx.update(|_, cx| {
+            connection.send_update(
+                child_session_id.clone(),
+                acp_v1::SessionUpdate::SessionInfoUpdate(
+                    acp_v1::SessionInfoUpdate::new().title("Child title"),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.load_subagent_session(
+                child_session_id.clone(),
+                root_session_id.clone(),
+                window,
+                cx,
+            );
+            assert_eq!(view.thread_view(&child_session_id), Some(child.clone()));
+            view.navigate_to_thread(child_session_id.clone(), window, cx);
+            assert_eq!(view.active_thread(), Some(&child));
+            assert_eq!(view.root_session_id.as_ref(), Some(&root_session_id));
+            view.navigate_to_thread(root_session_id.clone(), window, cx);
+            assert_eq!(view.active_thread().cloned(), view.root_thread_view());
+        });
+        let child_thread = child.read_with(cx, |view, _| view.thread.clone());
+        child_thread.update(cx, |_, cx| {
+            cx.emit(AcpThreadEvent::LoadError(LoadError::Other(
+                "Child disconnected".into(),
+            )));
+        });
+        cx.run_until_parked();
+        conversation_view.read_with(cx, |view, _| {
+            assert!(view.as_connected().is_some());
+            assert!(view.root_thread_view().is_some());
+        });
+        child.read_with(cx, |view, _| assert!(view.thread_error.is_some()));
+        let root = conversation_view.read_with(cx, |view, _| view.root_thread_view());
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(child_session_id.clone(), window, cx);
+            assert!(!view.as_connected().expect("connected").has_thread_error(cx));
+            let store = view.project.read(cx).agent_server_store().clone();
+            store.update(cx, |_, cx| cx.emit(project::AgentServersUpdated));
+        });
+        cx.run_until_parked();
+        conversation_view.read_with(cx, |view, _| {
+            assert_eq!(view.root_thread_view(), root);
+            assert_eq!(view.active_thread(), Some(&child));
+        });
+        assert_eq!(metadata_updates.get(), 0);
+    }
+
+    #[derive(Clone)]
+    struct ReplayedSubagentConnection {
+        root_updates: Arc<Vec<acp_v1::SessionUpdate>>,
+        loaded_sessions: Arc<Mutex<Vec<acp_v1::SessionId>>>,
+    }
+
+    impl AgentConnection for ReplayedSubagentConnection {
+        fn agent_id(&self) -> AgentId {
+            "replayed-subagents".into()
+        }
+
+        fn telemetry_id(&self) -> SharedString {
+            "replayed-subagents".into()
+        }
+
+        fn new_session(
+            self: Rc<Self>,
+            _project: Entity<Project>,
+            _work_dirs: PathList,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            Task::ready(Err(anyhow!("expected a persisted session to be loaded")))
+        }
+
+        fn supports_load_session(&self) -> bool {
+            true
+        }
+
+        fn load_session(
+            self: Rc<Self>,
+            session_id: acp_v1::SessionId,
+            project: Entity<Project>,
+            _work_dirs: PathList,
+            _title: Option<SharedString>,
+            cx: &mut App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            self.loaded_sessions.lock().push(session_id.clone());
+            let thread = build_test_thread(
+                self.clone(),
+                project,
+                "ReplayedSubagentConnection",
+                session_id.clone(),
+                cx,
+            );
+            if session_id == acp_v1::SessionId::new("persisted-root") {
+                for update in self.root_updates.iter() {
+                    thread
+                        .update(cx, |thread, cx| {
+                            thread.handle_session_update(update.clone(), cx)
+                        })
+                        .expect("persisted update");
+                }
+            }
+            Task::ready(Ok(thread))
+        }
+
+        fn auth_methods(&self) -> &[acp_v1::AuthMethod] {
+            &[]
+        }
+
+        fn authenticate(
+            &self,
+            _method_id: acp_v1::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<()>> {
+            Task::ready(Ok(()))
+        }
+
+        fn prompt(
+            &self,
+            _params: acp_v1::PromptRequest,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<acp_v1::PromptResponse>> {
+            Task::ready(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+        }
+
+        fn cancel(&self, _session_id: &acp_v1::SessionId, _cx: &mut App) {}
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    async fn load_replayed_subagent_conversation(
+        connection: ReplayedSubagentConnection,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ConversationView>, &mut VisualTestContext) {
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let thread_store = cx.update(|_, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+        assert!(connection.loaded_sessions.lock().is_empty());
+        let conversation = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(StubAgentServer::new(connection)),
+                    connection_store,
+                    Agent::Custom { id: "Test".into() },
+                    Some(acp_v1::SessionId::new("persisted-root")),
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project,
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        (conversation, cx)
+    }
+
+    #[gpui::test]
+    async fn test_cold_replay_loads_children_from_persisted_parent_links(cx: &mut TestAppContext) {
+        init_test(cx);
+        let updates: Vec<_> = ["z-child", "a-child", "z-child"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, session_id)| {
+                acp_v1::SessionUpdate::ToolCall(
+                    acp_v1::ToolCall::new(format!("spawn-{index}"), "Delegate").meta(
+                        acp_v1::Meta::from_iter([(
+                            "subagent_session_info".into(),
+                            serde_json::json!({ "session_id": session_id, "message_start_index": 0 }),
+                        )]),
+                    ),
+                )
+            })
+            .collect();
+        let persisted = serde_json::to_string(&updates).expect("serialize history");
+        let loaded_sessions = Arc::new(Mutex::new(Vec::new()));
+        let connection = ReplayedSubagentConnection {
+            root_updates: Arc::new(serde_json::from_str(&persisted).expect("deserialize history")),
+            loaded_sessions: loaded_sessions.clone(),
+        };
+        let (conversation, cx) = load_replayed_subagent_conversation(connection, cx).await;
+        let root_session_id = acp_v1::SessionId::new("persisted-root");
+        conversation.read_with(cx, |view, cx| {
+            assert_eq!(view.as_connected().expect("connected").threads.len(), 3);
+            let children: Vec<_> = view
+                .child_threads(&root_session_id, cx)
+                .iter()
+                .map(|child| {
+                    let thread = child.read(cx).thread.read(cx);
+                    assert_eq!(thread.parent_session_id(), Some(&root_session_id));
+                    thread.session_id().clone()
+                })
+                .collect();
+            assert_eq!(
+                children,
+                vec![
+                    acp_v1::SessionId::new("z-child"),
+                    acp_v1::SessionId::new("a-child")
+                ]
+            );
+            assert!(!view.is_busy(cx));
+        });
+        let mut loaded = loaded_sessions.lock().clone();
+        loaded.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            loaded,
+            vec![
+                acp_v1::SessionId::new("a-child"),
+                root_session_id,
+                acp_v1::SessionId::new("z-child")
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_replayed_subagent_metadata_restores_children_in_tool_call_order(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let mut updates: Vec<_> = (0..3)
+            .map(|index| {
+                acp_v1::SessionUpdate::ToolCall(acp_v1::ToolCall::new(
+                    format!("spawn-{index}"),
+                    "Delegate",
+                ))
+            })
+            .collect();
+        for (index, session_id) in [(1, "a-child"), (2, "z-child"), (0, "z-child")] {
+            updates.push(acp_v1::SessionUpdate::ToolCallUpdate(
+                acp_v1::ToolCallUpdate::new(
+                    format!("spawn-{index}"),
+                    acp_v1::ToolCallUpdateFields::new(),
+                )
+                .meta(acp_v1::Meta::from_iter([(
+                    "subagent_session_info".into(),
+                    serde_json::json!({ "session_id": session_id, "message_start_index": 0 }),
+                )])),
+            ));
+        }
+        let loaded_sessions = Arc::new(Mutex::new(Vec::new()));
+        let connection = ReplayedSubagentConnection {
+            root_updates: Arc::new(updates),
+            loaded_sessions: loaded_sessions.clone(),
+        };
+        let (conversation_view, cx) = load_replayed_subagent_conversation(connection, cx).await;
+        let root_session_id = acp_v1::SessionId::new("persisted-root");
+        conversation_view.read_with(cx, |view, cx| {
+            let root_view = view.root_thread_view().expect("root view");
+            let root_view = root_view.read(cx);
+            assert_eq!(root_view.thread.read(cx).entries().len(), 3);
+            assert_eq!(root_view.list_state.item_count(), 3);
+            for index in 0..3 {
+                assert!(root_view.entry_view_state.read(cx).entry(index).is_some());
+            }
+            let sessions: Vec<_> = view
+                .child_threads(&root_session_id, cx)
+                .iter()
+                .map(|child| child.read(cx).thread.read(cx).session_id().clone())
+                .collect();
+            assert_eq!(
+                sessions,
+                vec![
+                    acp_v1::SessionId::new("z-child"),
+                    acp_v1::SessionId::new("a-child")
+                ]
+            );
+            let connected = view.as_connected().expect("connected");
+            assert_eq!(connected.threads.len(), 3);
+            assert!(connected.loading_subagents.is_empty());
+        });
+        let mut loaded = loaded_sessions.lock().clone();
+        loaded.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            loaded,
+            vec![
+                acp_v1::SessionId::new("a-child"),
+                root_session_id,
+                acp_v1::SessionId::new("z-child")
+            ]
+        );
     }
 
     #[gpui::test]

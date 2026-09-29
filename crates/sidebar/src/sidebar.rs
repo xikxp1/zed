@@ -149,9 +149,7 @@ enum ArchiveWorktreeOutcome {
 enum ActiveEntry {
     Thread {
         thread_id: agent_ui::ThreadId,
-        /// Stable remote identifier, used for matching when thread_id
-        /// differs (e.g. after cross-window activation creates a new
-        /// local ThreadId).
+        /// Remote identifier for restoring the root session.
         session_id: Option<acp::SessionId>,
         workspace: Entity<Workspace>,
     },
@@ -178,21 +176,34 @@ impl ActiveEntry {
         matches!(self, ActiveEntry::Terminal { terminal_id: active_terminal_id, .. } if *active_terminal_id == terminal_id)
     }
 
+    fn matches_visible_entry(&self, entry: &ListEntry, cx: &App) -> bool {
+        if !matches!(self, Self::Thread { .. }) {
+            return self.matches_entry(entry);
+        }
+        let active_child = self
+            .workspace()
+            .read(cx)
+            .panel::<AgentPanel>(cx)
+            .and_then(|panel| {
+                let conversation = panel.read(cx).active_conversation_view()?;
+                let view = conversation.read(cx).active_thread()?;
+                let thread = view.read(cx).thread.read(cx);
+                thread
+                    .parent_session_id()
+                    .map(|_| thread.session_id().clone())
+            });
+        if let Some(session_id) = active_child {
+            return matches!((self, entry), (
+                ActiveEntry::Thread { thread_id, .. }, ListEntry::Subagent(child)
+            ) if *thread_id == child.root_thread_id && session_id == child.session_id);
+        }
+        self.matches_entry(entry)
+    }
+
     fn matches_entry(&self, entry: &ListEntry) -> bool {
         match (self, entry) {
-            (
-                ActiveEntry::Thread {
-                    thread_id,
-                    session_id,
-                    ..
-                },
-                ListEntry::Thread(thread),
-            ) => {
+            (ActiveEntry::Thread { thread_id, .. }, ListEntry::Thread(thread)) => {
                 *thread_id == thread.metadata.thread_id
-                    || session_id
-                        .as_ref()
-                        .zip(thread.metadata.session_id.as_ref())
-                        .is_some_and(|(a, b)| a == b)
             }
             (ActiveEntry::Terminal { terminal_id, .. }, ListEntry::Terminal(terminal)) => {
                 *terminal_id == terminal.metadata.terminal_id
@@ -204,9 +215,10 @@ impl ActiveEntry {
 
 #[derive(Clone, Debug)]
 struct ActiveThreadInfo {
-    session_id: acp::SessionId,
+    thread_id: ThreadId,
     title: SharedString,
     status: AgentThreadStatus,
+    is_busy: bool,
     icon: IconName,
     icon_from_external_svg: Option<SharedString>,
     is_background: bool,
@@ -357,6 +369,7 @@ struct ThreadEntry {
     icon: IconName,
     icon_from_external_svg: Option<SharedString>,
     status: AgentThreadStatus,
+    is_busy: bool,
     workspace: ThreadEntryWorkspace,
     is_live: bool,
     is_background: bool,
@@ -365,6 +378,20 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
+    has_children: bool,
+}
+
+#[derive(Clone)]
+struct SubagentEntry {
+    root_thread_id: ThreadId,
+    session_id: acp::SessionId,
+    parent_session_id: acp::SessionId,
+    conversation: Entity<agent_ui::ConversationView>,
+    workspace: Entity<Workspace>,
+    title: SharedString,
+    status: AgentThreadStatus,
+    depth: usize,
+    has_children: bool,
 }
 
 #[derive(Clone)]
@@ -385,6 +412,7 @@ impl ThreadEntry {
     fn apply_active_info(&mut self, info: &ActiveThreadInfo) {
         self.metadata.title = Some(info.title.clone());
         self.status = info.status;
+        self.is_busy = info.is_busy;
         self.icon = info.icon;
         self.icon_from_external_svg = info.icon_from_external_svg.clone();
         self.is_live = true;
@@ -407,6 +435,7 @@ enum ListEntry {
         has_threads: bool,
     },
     Thread(Arc<ThreadEntry>),
+    Subagent(SubagentEntry),
     Terminal(TerminalEntry),
 }
 
@@ -427,7 +456,7 @@ impl RenameTarget {
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Subagent(_) | ListEntry::ProjectHeader { .. } => None,
         }
     }
 }
@@ -453,7 +482,31 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Subagent(_) | ListEntry::ProjectHeader { .. } => None,
+        }
+    }
+}
+
+impl ListEntry {
+    fn tree_node(&self) -> Option<((ThreadId, acp::SessionId), bool)> {
+        match self {
+            Self::Thread(thread) => thread
+                .metadata
+                .session_id
+                .as_ref()
+                .map(|id| ((thread.metadata.thread_id, id.clone()), thread.has_children)),
+            Self::Subagent(child) => Some((
+                (child.root_thread_id, child.session_id.clone()),
+                child.has_children,
+            )),
+            _ => None,
+        }
+    }
+
+    fn tree_depth(&self) -> usize {
+        match self {
+            Self::Subagent(child) => child.depth,
+            _ => 0,
         }
     }
 }
@@ -463,6 +516,7 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
+            ListEntry::Subagent(child) => Some(&child.session_id),
             ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
         }
     }
@@ -477,6 +531,7 @@ impl ListEntry {
                 ThreadEntryWorkspace::Open(ws) => vec![ws.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
+            ListEntry::Subagent(child) => vec![child.workspace.clone()],
             ListEntry::Terminal(terminal) => match &terminal.workspace {
                 ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
@@ -512,7 +567,7 @@ struct SidebarContents {
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
 /// across rebuilds. Equal shapes must render to the same height; add any new
 /// height-affecting state here.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum EntryShape {
     ProjectHeader {
         key: ProjectGroupKey,
@@ -523,6 +578,7 @@ enum EntryShape {
         is_collapsed: bool,
     },
     Thread(ThreadId),
+    Subagent(ThreadId, acp::SessionId, usize),
     Terminal(TerminalId),
 }
 
@@ -777,6 +833,7 @@ pub struct Sidebar {
     rename_editor: Entity<Editor>,
     list_state: ListState,
     contents: SidebarContents,
+    collapsed_subagent_sessions: HashSet<(ThreadId, acp::SessionId)>,
     /// The index of the list item that currently has the keyboard focus
     ///
     /// Note: This is NOT the same as the active item.
@@ -803,7 +860,7 @@ pub struct Sidebar {
     /// Persists live thread statuses across rebuilds so that Running→Completed
     /// transitions can be detected even when the group is collapsed (and
     /// thread entries are not present in the list).
-    live_thread_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)>,
+    live_thread_statuses: HashMap<ThreadId, AgentThreadStatus>,
     /// Remembers whether each draft last rendered as empty or with content so
     /// that when a draft that was empty gains content again, we refresh
     /// its interaction time.
@@ -945,6 +1002,7 @@ impl Sidebar {
             rename_editor,
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
             contents: SidebarContents::default(),
+            collapsed_subagent_sessions: HashSet::new(),
             selection: None,
             active_entry: None,
             hovered_thread_index: None,
@@ -1411,8 +1469,7 @@ impl Sidebar {
         let mut entries = Vec::new();
         let mut notified_threads = previous.notified_threads;
         let mut notified_terminals: HashSet<TerminalId> = HashSet::new();
-        let mut new_live_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)> =
-            HashMap::new();
+        let mut new_live_statuses: HashMap<ThreadId, AgentThreadStatus> = HashMap::new();
         let mut current_session_ids: HashSet<acp::SessionId> = HashSet::new();
         let mut current_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut current_terminal_ids: HashSet<TerminalId> = HashSet::new();
@@ -1625,6 +1682,7 @@ impl Sidebar {
                             icon,
                             icon_from_external_svg,
                             status: AgentThreadStatus::default(),
+                            is_busy: false,
                             workspace,
                             is_live: false,
                             is_background: false,
@@ -1633,6 +1691,7 @@ impl Sidebar {
                             highlight_positions: Vec::new(),
                             worktrees,
                             diff_stats: DiffStats::default(),
+                            has_children: false,
                         })
                     };
 
@@ -1754,8 +1813,7 @@ impl Sidebar {
 
                 // Build a lookup from live_infos and compute running/waiting
                 // counts in a single pass.
-                let mut live_info_by_session: HashMap<acp::SessionId, ActiveThreadInfo> =
-                    HashMap::new();
+                let mut live_info_by_thread: HashMap<ThreadId, ActiveThreadInfo> = HashMap::new();
                 for info in live_infos {
                     if info.status == AgentThreadStatus::Running {
                         has_running_threads = true;
@@ -1763,22 +1821,20 @@ impl Sidebar {
                     if info.status == AgentThreadStatus::WaitingForConfirmation {
                         waiting_thread_count += 1;
                     }
-                    live_info_by_session.insert(info.session_id.clone(), info);
+                    live_info_by_thread.insert(info.thread_id, info);
                 }
 
                 // Merge live info into threads and update notification state
                 // in a single pass.
                 for thread in &mut threads {
-                    if let Some(session_id) = thread.metadata.session_id.clone() {
-                        if let Some(info) = live_info_by_session.get(&session_id) {
-                            let status = info.status;
-                            let thread_id = thread.metadata.thread_id;
-                            Arc::make_mut(thread).apply_active_info(info);
-                            new_live_statuses.insert(session_id, (status, thread_id));
-                        }
+                    if thread.draft.is_none()
+                        && let Some(info) = live_info_by_thread.get(&thread.metadata.thread_id)
+                    {
+                        let status = info.status;
+                        let thread_id = thread.metadata.thread_id;
+                        Arc::make_mut(thread).apply_active_info(info);
+                        new_live_statuses.insert(thread_id, status);
                     }
-
-                    let session_id = &thread.metadata.session_id;
                     let is_active_thread = self.active_entry.as_ref().is_some_and(|entry| {
                         entry.is_active_thread(&thread.metadata.thread_id)
                             && active_workspace
@@ -1788,10 +1844,8 @@ impl Sidebar {
 
                     if thread.status == AgentThreadStatus::Completed
                         && !is_active_thread
-                        && session_id
-                            .as_ref()
-                            .and_then(|sid| old_statuses.get(sid))
-                            .is_some_and(|(s, _)| *s == AgentThreadStatus::Running)
+                        && old_statuses.get(&thread.metadata.thread_id)
+                            == Some(&AgentThreadStatus::Running)
                     {
                         notified_threads.insert(thread.metadata.thread_id);
                     }
@@ -1814,27 +1868,12 @@ impl Sidebar {
                     if info.status == AgentThreadStatus::WaitingForConfirmation {
                         waiting_thread_count += 1;
                     }
-                    // Resolve the thread_id for this session so we can
-                    // track its status and detect transitions even while
-                    // the group is collapsed.
-                    let thread_id = old_statuses
-                        .get(&info.session_id)
-                        .map(|(_, tid)| *tid)
-                        .or_else(|| {
-                            ThreadMetadataStore::global(cx)
-                                .read(cx)
-                                .entry_by_session(&info.session_id)
-                                .map(|m| m.thread_id)
-                        });
-
-                    if let Some(thread_id) = thread_id {
-                        let old_status = old_statuses.get(&info.session_id).map(|(s, _)| *s);
-                        new_live_statuses.insert(info.session_id.clone(), (info.status, thread_id));
-                        if info.status == AgentThreadStatus::Completed
-                            && old_status == Some(AgentThreadStatus::Running)
-                        {
-                            notified_threads.insert(thread_id);
-                        }
+                    let old_status = old_statuses.get(&info.thread_id);
+                    new_live_statuses.insert(info.thread_id, info.status);
+                    if info.status == AgentThreadStatus::Completed
+                        && old_status == Some(&AgentThreadStatus::Running)
+                    {
+                        notified_threads.insert(info.thread_id);
                     }
                 }
 
@@ -2004,6 +2043,54 @@ impl Sidebar {
             }
         }
 
+        let mut conversations = HashMap::new();
+        for workspace in &workspaces {
+            if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                for conversation in panel.read(cx).conversation_views() {
+                    let thread_id = conversation.read(cx).parent_id();
+                    conversations.insert(thread_id, (conversation, workspace.clone()));
+                }
+            }
+        }
+        entries = entries
+            .into_iter()
+            .flat_map(|mut entry| {
+                let mut descendants = Vec::new();
+                if let ListEntry::Thread(thread) = &mut entry
+                    && let Some(session_id) = &thread.metadata.session_id
+                    && let Some((conversation, workspace)) =
+                        conversations.get(&thread.metadata.thread_id)
+                {
+                    let children = conversation.read(cx).child_threads(session_id, cx);
+                    let mut seen = HashSet::from([session_id.clone()]);
+                    if !self
+                        .collapsed_subagent_sessions
+                        .contains(&(thread.metadata.thread_id, session_id.clone()))
+                    {
+                        Self::append_subagent_entries(
+                            &mut descendants,
+                            conversation,
+                            workspace,
+                            session_id,
+                            1,
+                            &self.collapsed_subagent_sessions,
+                            &mut seen,
+                            cx,
+                        );
+                    }
+                    Arc::make_mut(thread).has_children = !children.is_empty();
+                }
+                std::iter::once(entry).chain(descendants)
+            })
+            .collect();
+        project_header_indices = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                matches!(entry, ListEntry::ProjectHeader { .. }).then_some(index)
+            })
+            .collect();
+
         notified_threads.retain(|id| current_thread_ids.contains(id));
 
         self.thread_last_accessed
@@ -2020,6 +2107,61 @@ impl Sidebar {
             project_header_indices,
             has_open_projects,
         };
+    }
+
+    fn append_subagent_entries(
+        entries: &mut Vec<ListEntry>,
+        conversation: &Entity<agent_ui::ConversationView>,
+        workspace: &Entity<Workspace>,
+        parent_session_id: &acp::SessionId,
+        depth: usize,
+        collapsed: &HashSet<(ThreadId, acp::SessionId)>,
+        seen: &mut HashSet<acp::SessionId>,
+        cx: &App,
+    ) {
+        for child in conversation.read(cx).child_threads(parent_session_id, cx) {
+            let thread = child.read(cx).thread.read(cx);
+            let session_id = thread.session_id().clone();
+            if !seen.insert(session_id.clone()) {
+                continue;
+            }
+            let has_children = conversation
+                .read(cx)
+                .child_threads(&session_id, cx)
+                .iter()
+                .any(|child| !seen.contains(child.read(cx).thread.read(cx).session_id()));
+            entries.push(ListEntry::Subagent(SubagentEntry {
+                root_thread_id: conversation.read(cx).parent_id(),
+                session_id: session_id.clone(),
+                parent_session_id: parent_session_id.clone(),
+                conversation: conversation.clone(),
+                workspace: workspace.clone(),
+                title: thread.title().unwrap_or_else(|| "Subagent".into()),
+                status: if thread.is_waiting_for_confirmation() {
+                    AgentThreadStatus::WaitingForConfirmation
+                } else if thread.had_error() {
+                    AgentThreadStatus::Error
+                } else if thread.status() == ThreadStatus::Generating {
+                    AgentThreadStatus::Running
+                } else {
+                    AgentThreadStatus::Completed
+                },
+                depth,
+                has_children,
+            }));
+            if !collapsed.contains(&(conversation.read(cx).parent_id(), session_id.clone())) {
+                Self::append_subagent_entries(
+                    entries,
+                    conversation,
+                    workspace,
+                    &session_id,
+                    depth + 1,
+                    collapsed,
+                    seen,
+                    cx,
+                );
+            }
+        }
     }
 
     fn schedule_update_entries(&mut self, select_first_after_update: bool, cx: &mut Context<Self>) {
@@ -2053,7 +2195,16 @@ impl Sidebar {
         let previous_shapes: Vec<EntryShape> =
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
+        let selected_shape = self
+            .selection
+            .and_then(|index| previous_shapes.get(index).cloned());
         self.rebuild_contents(cx);
+        if let Some(selected_shape) = selected_shape {
+            let selection = self
+                .entry_shapes(multi_workspace.read(cx))
+                .position(|shape| shape == selected_shape);
+            self.selection = selection;
+        }
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
@@ -2117,6 +2268,9 @@ impl Sidebar {
                     .unwrap_or(false),
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
+            ListEntry::Subagent(child) => {
+                EntryShape::Subagent(child.root_thread_id, child.session_id.clone(), child.depth)
+            }
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
         })
     }
@@ -2231,7 +2385,7 @@ impl Sidebar {
         let is_active = self
             .active_entry
             .as_ref()
-            .is_some_and(|active| active.matches_entry(entry));
+            .is_some_and(|active| active.matches_visible_entry(entry, cx));
 
         let rendered = match entry {
             ListEntry::ProjectHeader {
@@ -2265,7 +2419,36 @@ impl Sidebar {
                     cx,
                 )
             }
-            ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
+            ListEntry::Thread(thread) => {
+                let row = self.render_thread(ix, thread, is_active, is_selected, cx);
+                if thread.has_children
+                    && let Some(session_id) = &thread.metadata.session_id
+                {
+                    self.render_tree_row(
+                        ix,
+                        thread.metadata.thread_id,
+                        session_id,
+                        0,
+                        true,
+                        row,
+                        cx,
+                    )
+                } else {
+                    row
+                }
+            }
+            ListEntry::Subagent(child) => {
+                let row = self.render_subagent(ix, child, is_active, is_selected, cx);
+                self.render_tree_row(
+                    ix,
+                    child.root_thread_id,
+                    &child.session_id,
+                    child.depth,
+                    child.has_children,
+                    row,
+                    cx,
+                )
+            }
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
@@ -2281,6 +2464,171 @@ impl Sidebar {
         } else {
             rendered
         }
+    }
+
+    fn render_tree_row(
+        &self,
+        index: usize,
+        root_thread_id: ThreadId,
+        session_id: &acp::SessionId,
+        depth: usize,
+        has_children: bool,
+        row: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let collapsed = self
+            .collapsed_subagent_sessions
+            .contains(&(root_thread_id, session_id.clone()));
+        h_flex()
+            .w_full()
+            .pl(px(depth as f32 * 14.0))
+            .child(div().w_5().flex_none().when(has_children, |this| {
+                this.child(
+                    IconButton::new(
+                        SharedString::from(format!(
+                            "subagent-disclosure-{}-{session_id}",
+                            root_thread_id.to_key_string()
+                        )),
+                        if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        },
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text(if collapsed {
+                        "Expand Subagents"
+                    } else {
+                        "Collapse Subagents"
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_subagents(index, cx);
+                    })),
+                )
+            }))
+            .child(div().min_w_0().flex_1().child(row))
+            .into_any_element()
+    }
+
+    fn render_subagent(
+        &self,
+        index: usize,
+        child: &SubagentEntry,
+        is_active: bool,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let child = child.clone();
+        let stopped_child = child.clone();
+        ThreadItem::new(
+            SharedString::from(format!(
+                "subagent-entry-{}-{}",
+                child.root_thread_id.to_key_string(),
+                child.session_id
+            )),
+            child.title.clone(),
+        )
+        .status(child.status)
+        .selected(is_active)
+        .focused(is_selected)
+        .hovered(self.hovered_thread_index == Some(index))
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            if *hovered {
+                this.hovered_thread_index = Some(index);
+            } else if this.hovered_thread_index == Some(index) {
+                this.hovered_thread_index = None;
+            }
+            cx.notify();
+        }))
+        .when(
+            matches!(
+                child.status,
+                AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation
+            ),
+            |this| {
+                this.action_slot(
+                    IconButton::new(
+                        SharedString::from(format!(
+                            "stop-subagent-{}-{}",
+                            child.root_thread_id.to_key_string(),
+                            child.session_id
+                        )),
+                        IconName::Stop,
+                    )
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Error)
+                    .tooltip(Tooltip::text("Stop Subagent"))
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        Self::stop_subagent(&stopped_child, cx);
+                    }),
+                )
+            },
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.selection = None;
+            this.activate_subagent(&child, window, cx);
+        }))
+        .into_any_element()
+    }
+
+    fn stop_subagent(child: &SubagentEntry, cx: &mut App) {
+        if let Some(view) = child.conversation.read(cx).thread_view(&child.session_id) {
+            view.update(cx, |view, cx| view.cancel_generation(cx));
+        }
+    }
+
+    fn toggle_subagents(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.contents.entries.get(index) else {
+            return;
+        };
+        let Some((node_key, true)) = entry.tree_node() else {
+            return;
+        };
+        let depth = entry.tree_depth();
+        if !self.collapsed_subagent_sessions.remove(&node_key) {
+            self.collapsed_subagent_sessions.insert(node_key);
+            if self.selection.is_some_and(|selected| selected > index) {
+                let end = self
+                    .contents
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .skip(index + 1)
+                    .find(|(_, entry)| entry.tree_depth() <= depth)
+                    .map_or(self.contents.entries.len(), |(index, _)| index);
+                if self.selection.is_some_and(|selected| selected < end) {
+                    self.selection = Some(index);
+                }
+            }
+        }
+        self.update_entries(cx);
+    }
+
+    fn activate_subagent(
+        &mut self,
+        child: &SubagentEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_workspace(&child.workspace, window, cx);
+        if let Some(panel) = child.workspace.read(cx).panel::<AgentPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.navigate_to_session(
+                    child.root_thread_id,
+                    child.session_id.clone(),
+                    window,
+                    cx,
+                );
+            });
+            self.sync_active_entry_from_panel(&panel, cx);
+        }
+        child.workspace.update(cx, |workspace, cx| {
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+        self.record_thread_access(&child.root_thread_id);
+        cx.notify();
     }
 
     fn render_remote_project_icon(
@@ -3667,6 +4015,10 @@ impl Sidebar {
                     }
                 }
             }
+            ListEntry::Subagent(child) => {
+                let child = child.clone();
+                self.activate_subagent(&child, window, cx);
+            }
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
@@ -3715,11 +4067,29 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let load_thread = |agent_panel: Entity<AgentPanel>,
-                           metadata: &ThreadMetadata,
-                           focus: bool,
-                           window: &mut Window,
-                           cx: &mut App| {
+        Self::load_agent_thread_in_workspace_with_session(
+            workspace,
+            metadata,
+            metadata.session_id.clone(),
+            focus,
+            window,
+            cx,
+        );
+    }
+
+    fn load_agent_thread_in_workspace_with_session(
+        workspace: &Entity<Workspace>,
+        metadata: &ThreadMetadata,
+        session_id: Option<acp::SessionId>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let load_thread = move |agent_panel: Entity<AgentPanel>,
+                                metadata: &ThreadMetadata,
+                                focus: bool,
+                                window: &mut Window,
+                                cx: &mut App| {
             agent_panel.update(cx, |panel, cx| {
                 panel.load_agent_thread(
                     Agent::from(metadata.agent_id.clone()),
@@ -3731,6 +4101,9 @@ impl Sidebar {
                     window,
                     cx,
                 );
+                if let Some(session_id) = session_id.clone() {
+                    panel.navigate_to_session(metadata.thread_id, session_id, window, cx);
+                }
             });
         };
 
@@ -3968,6 +4341,13 @@ impl Sidebar {
         };
 
         if self.is_thread_active_in_workspace(&metadata.thread_id, workspace, cx) {
+            if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx)
+                && let Some(session_id) = metadata.session_id.clone()
+            {
+                panel.update(cx, |panel, cx| {
+                    panel.navigate_to_session(metadata.thread_id, session_id, window, cx);
+                });
+            }
             workspace.update(cx, |workspace, cx| {
                 workspace.focus_panel::<AgentPanel>(window, cx);
             });
@@ -4369,6 +4749,17 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self.selection else { return };
+        if let Some((node_key, true)) = self.contents.entries.get(ix).and_then(ListEntry::tree_node)
+        {
+            if self.collapsed_subagent_sessions.contains(&node_key) {
+                self.toggle_subagents(ix, cx);
+            } else if ix + 1 < self.contents.entries.len() {
+                self.selection = Some(ix + 1);
+                self.list_state.scroll_to_reveal_item(ix + 1);
+                cx.notify();
+            }
+            return;
+        }
 
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => {
@@ -4393,6 +4784,27 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self.selection else { return };
+        if let Some((node_key, true)) = self.contents.entries.get(ix).and_then(ListEntry::tree_node)
+            && !self.collapsed_subagent_sessions.contains(&node_key)
+        {
+            self.toggle_subagents(ix, cx);
+            return;
+        }
+        if let Some(ListEntry::Subagent(child)) = self.contents.entries.get(ix) {
+            self.selection = self.contents.entries.iter().take(ix).rposition(|entry| {
+                entry
+                    .tree_node()
+                    .is_some_and(|((root_thread_id, session_id), _)| {
+                        root_thread_id == child.root_thread_id
+                            && session_id == child.parent_session_id
+                    })
+            });
+            if let Some(index) = self.selection {
+                self.list_state.scroll_to_reveal_item(index);
+            }
+            cx.notify();
+            return;
+        }
 
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => {
@@ -4402,7 +4814,7 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
+            Some(ListEntry::Thread(_) | ListEntry::Subagent(_) | ListEntry::Terminal(_)) => {
                 for i in (0..ix).rev() {
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
                     {
@@ -4426,15 +4838,25 @@ impl Sidebar {
     ) {
         let Some(ix) = self.selection else { return };
 
+        if let Some((_, true)) = self.contents.entries.get(ix).and_then(ListEntry::tree_node) {
+            self.toggle_subagents(ix, cx);
+            return;
+        }
+        if matches!(self.contents.entries.get(ix), Some(ListEntry::Subagent(_))) {
+            return;
+        }
+
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
-                matches!(
-                    self.contents.entries.get(i),
-                    Some(ListEntry::ProjectHeader { .. })
-                )
-            }),
+            Some(ListEntry::Thread(_) | ListEntry::Subagent(_) | ListEntry::Terminal(_)) => {
+                (0..ix).rev().find(|&i| {
+                    matches!(
+                        self.contents.entries.get(i),
+                        Some(ListEntry::ProjectHeader { .. })
+                    )
+                })
+            }
             None => None,
         };
 
@@ -4473,6 +4895,7 @@ impl Sidebar {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.collapsed_subagent_sessions.clear();
         if let Some(mw) = self.multi_workspace.upgrade() {
             mw.update(cx, |mw, _cx| {
                 mw.set_all_groups_expanded(true);
@@ -5383,6 +5806,28 @@ impl Sidebar {
                 .as_ref()
                 .map(|thread| thread.metadata.thread_id)
         });
+        if thread_id.is_some_and(|thread_id| {
+            self.multi_workspace
+                .upgrade()
+                .is_some_and(|multi_workspace| {
+                    multi_workspace.read(cx).workspaces().any(|workspace| {
+                        workspace
+                            .read(cx)
+                            .panel::<AgentPanel>(cx)
+                            .is_some_and(|panel| {
+                                panel.read(cx).conversation_views().into_iter().any(|view| {
+                                    let view = view.read(cx);
+                                    // Explicit archive may stop the root, but must not
+                                    // remove a worktree still in use by its children.
+                                    view.parent_id() == thread_id
+                                        && (view.is_loading() || view.has_busy_subagents(cx))
+                                })
+                            })
+                    })
+                })
+        }) {
+            return;
+        }
         let active_workspace = thread_id.and_then(|thread_id| {
             self.active_entry.as_ref().and_then(|entry| {
                 if entry.is_active_thread(&thread_id) {
@@ -5760,11 +6205,8 @@ impl Sidebar {
         };
         match self.contents.entries.get(ix) {
             Some(ListEntry::Thread(thread)) => {
-                match thread.status {
-                    AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation => {
-                        return;
-                    }
-                    AgentThreadStatus::Completed | AgentThreadStatus::Error => {}
+                if thread.is_busy {
+                    return;
                 }
                 if thread.draft.is_some() {
                     let workspace = thread.workspace.clone();
@@ -5836,7 +6278,7 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::Subagent(_) | ListEntry::ProjectHeader { .. } => unreachable!(),
             }
         }
 
@@ -5889,6 +6331,7 @@ impl Sidebar {
             .entries
             .iter()
             .filter_map(|entry| match entry {
+                ListEntry::Subagent(_) => None,
                 ListEntry::ProjectHeader { label, key, .. } => {
                     current_header_label = Some(label.clone());
                     current_header_key = Some(key.clone());
@@ -6098,6 +6541,12 @@ impl Sidebar {
         // Snapshot the active entry (thread or terminal) so dismissal can
         // restore it.
         let original_active_entry = self.active_entry.clone();
+        let original_session_id = original_active_entry.as_ref().and_then(|entry| {
+            let panel = entry.workspace().read(cx).panel::<AgentPanel>(cx)?;
+            let conversation = panel.read(cx).active_conversation_view()?;
+            let thread = conversation.read(cx).active_thread()?;
+            Some(thread.read(cx).session_id.clone())
+        });
         let original_metadata = match &original_active_entry {
             Some(ActiveEntry::Thread { thread_id, .. }) => {
                 entries.iter().find_map(|entry| match entry {
@@ -6150,9 +6599,10 @@ impl Sidebar {
                                     workspace: original_ws.clone(),
                                 });
                                 this.update_entries(cx);
-                                Self::load_agent_thread_in_workspace(
+                                Self::load_agent_thread_in_workspace_with_session(
                                     original_ws,
                                     metadata,
+                                    original_session_id.clone(),
                                     false,
                                     window,
                                     cx,
@@ -6258,10 +6708,7 @@ impl Sidebar {
         let is_selected = is_active;
         let is_draft = thread.draft.is_some();
         let is_empty_draft = thread.draft == Some(DraftKind::Empty);
-        let is_running = matches!(
-            thread.status,
-            AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation
-        );
+        let is_running = thread.is_busy;
         let is_renaming =
             self.rename_target == Some(RenameTarget::Thread(thread.metadata.thread_id));
 
@@ -7106,14 +7553,12 @@ impl Sidebar {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
-                (0..ix)
-                    .rev()
-                    .find_map(|i| match self.contents.entries.get(i) {
-                        Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
-                        _ => None,
-                    })
-            }
+            Some(ListEntry::Thread(_) | ListEntry::Subagent(_) | ListEntry::Terminal(_)) => (0..ix)
+                .rev()
+                .find_map(|i| match self.contents.entries.get(i) {
+                    Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
+                    _ => None,
+                }),
             _ => None,
         }
     }
@@ -7250,7 +7695,12 @@ impl Sidebar {
         let current_thread_pos = self.active_entry.as_ref().and_then(|active| {
             thread_indices
                 .iter()
-                .position(|&ix| active.matches_entry(&self.contents.entries[ix]))
+                .position(|&ix| match &self.contents.entries[ix] {
+                    ListEntry::Thread(thread) => {
+                        active.is_active_thread(&thread.metadata.thread_id)
+                    }
+                    entry => active.matches_entry(entry),
+                })
         });
 
         let next_pos = match current_thread_pos {
@@ -7295,7 +7745,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::Subagent(_) | ListEntry::ProjectHeader { .. } => {}
         }
     }
 
@@ -8109,26 +8559,26 @@ fn all_thread_infos_for_workspace(
             let is_title_generating = thread_view_ref
                 .as_native_thread(cx)
                 .is_some_and(|native_thread| native_thread.read(cx).is_generating_title());
-            let session_id = thread.session_id().clone();
             let is_background = agent_panel.is_retained_thread(&conversation_thread_id);
+            let is_busy = conversation_view.read(cx).is_busy(cx);
 
             let status = if has_pending_tool_call {
                 AgentThreadStatus::WaitingForConfirmation
             } else if thread.had_error() {
                 AgentThreadStatus::Error
+            } else if is_busy {
+                AgentThreadStatus::Running
             } else {
-                match thread.status() {
-                    ThreadStatus::Generating => AgentThreadStatus::Running,
-                    ThreadStatus::Idle => AgentThreadStatus::Completed,
-                }
+                AgentThreadStatus::Completed
             };
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
 
             Some(ActiveThreadInfo {
-                session_id,
+                thread_id: conversation_thread_id,
                 title,
                 status,
+                is_busy,
                 icon,
                 icon_from_external_svg,
                 is_background,
